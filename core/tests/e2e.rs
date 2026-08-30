@@ -1,4 +1,4 @@
-// allow: SIZE_OK — the requested single-server S1-S4 executable specification is intentionally
+// allow: SIZE_OK — the requested single-server S1-S5 executable specification is intentionally
 // kept in one integration-test target so its sequential state and lifecycle remain explicit.
 
 use std::fs::OpenOptions;
@@ -33,6 +33,12 @@ struct Claims<'a> {
 
 #[derive(Deserialize)]
 struct FileResponse {
+    id: Uuid,
+    folder_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct FolderResponse {
     id: Uuid,
 }
 
@@ -268,9 +274,23 @@ async fn upload(
     name: &str,
     bytes: &[u8],
 ) -> Response {
+    upload_into_folder(client, server, jwt, name, bytes, None).await
+}
+
+async fn upload_into_folder(
+    client: &Client,
+    server: &CoreServer,
+    jwt: &str,
+    name: &str,
+    bytes: &[u8],
+    folder_id: Option<Uuid>,
+) -> Response {
+    let folder_query = folder_id
+        .map(|id| format!("&folder_id={id}"))
+        .unwrap_or_default();
     client
         .post(format!(
-            "{}/v1/files?name={name}&mime=application/octet-stream",
+            "{}/v1/files?name={name}&mime=application/octet-stream{folder_query}",
             server.base_url
         ))
         .bearer_auth(jwt)
@@ -651,6 +671,177 @@ async fn scenario_s4(client: &Client, server: &CoreServer) {
     );
 }
 
+async fn scenario_s5(client: &Client, server: &CoreServer) {
+    let owner_id = Uuid::now_v7().to_string();
+    let jwt = server.jwt("e2e-s5", &owner_id);
+    let bytes = b"S5 folder chain bytes".to_vec();
+    let before = billing_status(client, server, &jwt).await.used_bytes;
+
+    let folder = expect_status(
+        client
+            .post(format!("{}/v1/folders", server.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({"name": "s5-folder"}))
+            .send()
+            .await
+            .expect("S5 create folder"),
+        StatusCode::CREATED,
+        "S5 create folder",
+    )
+    .await
+    .json::<FolderResponse>()
+    .await
+    .expect("S5 parse folder response");
+
+    expect_error_code(
+        client
+            .post(format!("{}/v1/folders", server.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({"name": "s5-folder"}))
+            .send()
+            .await
+            .expect("S5 duplicate folder request"),
+        StatusCode::CONFLICT,
+        "conflict",
+        "S5 duplicate folder name",
+    )
+    .await;
+
+    let file = expect_status(
+        upload_into_folder(
+            client,
+            server,
+            &jwt,
+            "s5-in-folder.bin",
+            &bytes,
+            Some(folder.id),
+        )
+        .await,
+        StatusCode::CREATED,
+        "S5 upload into folder",
+    )
+    .await
+    .json::<FileResponse>()
+    .await
+    .expect("S5 parse upload response");
+    assert_eq!(
+        file.folder_id,
+        Some(folder.id),
+        "S5 upload response must reference the target folder"
+    );
+
+    let in_folder = expect_status(
+        client
+            .get(format!(
+                "{}/v1/files?folder_id={}",
+                server.base_url, folder.id
+            ))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .expect("S5 list files in folder"),
+        StatusCode::OK,
+        "S5 list files in folder",
+    )
+    .await
+    .json::<FileListResponse>()
+    .await
+    .expect("S5 parse folder file list");
+    assert!(
+        in_folder.items.iter().any(|item| item.id == file.id),
+        "S5 folder listing must contain the uploaded file"
+    );
+
+    let all_files = expect_status(
+        client
+            .get(format!("{}/v1/files", server.base_url))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .expect("S5 list all files"),
+        StatusCode::OK,
+        "S5 list all files",
+    )
+    .await
+    .json::<FileListResponse>()
+    .await
+    .expect("S5 parse unfiltered file list");
+    assert!(
+        all_files.items.iter().any(|item| item.id == file.id),
+        "S5 unfiltered listing must contain the uploaded file"
+    );
+
+    expect_status(
+        client
+            .delete(format!("{}/v1/folders/{}", server.base_url, folder.id))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .expect("S5 delete folder"),
+        StatusCode::NO_CONTENT,
+        "S5 delete folder",
+    )
+    .await;
+
+    let after_delete = expect_status(
+        client
+            .get(format!(
+                "{}/v1/files?folder_id={}",
+                server.base_url, folder.id
+            ))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .expect("S5 list files after folder delete"),
+        StatusCode::OK,
+        "S5 list files after folder delete",
+    )
+    .await
+    .json::<FileListResponse>()
+    .await
+    .expect("S5 parse folder file list after delete");
+    assert!(
+        !after_delete.items.iter().any(|item| item.id == file.id),
+        "S5 deleted folder must not list its former files"
+    );
+
+    let unlinked = expect_status(
+        client
+            .get(format!("{}/v1/files/{}", server.base_url, file.id))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .expect("S5 get unlinked file"),
+        StatusCode::OK,
+        "S5 get unlinked file",
+    )
+    .await
+    .json::<FileResponse>()
+    .await
+    .expect("S5 parse unlinked file");
+    assert!(
+        unlinked.folder_id.is_none(),
+        "S5 folder deletion must set the file folder_id to NULL"
+    );
+
+    expect_status(
+        client
+            .delete(format!("{}/v1/files/{}", server.base_url, file.id))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .expect("S5 delete file"),
+        StatusCode::NO_CONTENT,
+        "S5 delete file",
+    )
+    .await;
+    let after = billing_status(client, server, &jwt).await.used_bytes;
+    assert_eq!(
+        after, before,
+        "S5 deletion must subtract exactly the file size"
+    );
+}
+
 #[ignore]
 #[test]
 fn e2e_suite() {
@@ -671,5 +862,6 @@ fn e2e_suite() {
         scenario_s2(&client, &server).await;
         scenario_s3(&client, &server).await;
         scenario_s4(&client, &server).await;
+        scenario_s5(&client, &server).await;
     });
 }
