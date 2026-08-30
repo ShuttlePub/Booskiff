@@ -8,7 +8,7 @@ use std::time::Duration;
 use aws_smithy_types::body::SdkBody;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -30,7 +30,6 @@ use super::upload_body::CountingBody;
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
 const BODY_LIMIT_SLACK: i64 = 1024 * 1024;
-const DOWNLOAD_URL_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct FileResponse {
@@ -109,16 +108,19 @@ impl FileRow {
     }
 }
 
-pub fn files_router(config: &Config) -> Router<AppState> {
+pub fn upload_router(config: &Config) -> Router<AppState> {
     let body_limit_i64 = config
         .plan_premium_max_file_bytes
         .saturating_add(BODY_LIMIT_SLACK);
     let body_limit = usize::try_from(body_limit_i64).unwrap_or(usize::MAX);
+    Router::new().route(
+        "/v1/files",
+        post(upload_file).route_layer(DefaultBodyLimit::max(body_limit)),
+    )
+}
+
+pub fn files_router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/v1/files",
-            post(upload_file).route_layer(DefaultBodyLimit::max(body_limit)),
-        )
         .route("/v1/files", get(list_files))
         .route("/v1/files/{id}", get(get_file).delete(delete_file))
         .route("/v1/files/{id}/download-url", get(download_url))
@@ -274,16 +276,24 @@ async fn delete_file(
         .begin()
         .await
         .map_err(|err| AppError::Internal(format!("begin delete file: {err}")))?;
-    sqlx::query("DELETE FROM file_objects WHERE file_id = $1")
+    let objects = sqlx::query("DELETE FROM file_objects WHERE file_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(|err| AppError::Internal(format!("delete file objects: {err}")))?;
-    sqlx::query("DELETE FROM files WHERE id = $1")
+    if objects.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("file {id}")));
+    }
+    let row_delete = sqlx::query("DELETE FROM files WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(|err| AppError::Internal(format!("delete file row: {err}")))?;
+    // A loser of a concurrent delete unblocks with zero rows; this guard
+    // prevents a double quota refund (commit-dropped tx rolls back).
+    if row_delete.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("file {id}")));
+    }
     subtract_used_bytes(&mut tx, &ctx.owner, row.size_bytes).await?;
     tx.commit()
         .await
@@ -309,7 +319,8 @@ async fn download_url(
     .await
     .map_err(|err| AppError::Internal(format!("load original object: {err}")))?;
     let key = key.ok_or_else(|| AppError::NotFound(format!("file object {id}")))?;
-    let url = state.s3.presign_get(&key, DOWNLOAD_URL_TTL).await?;
+    let ttl = Duration::from_secs(state.config.presigned_get_ttl_secs);
+    let url = state.s3.presign_get(&key, ttl).await?;
     Ok(Json(UrlResponse { url }))
 }
 
@@ -318,8 +329,6 @@ async fn publish_file(
     ctx: AccountContext,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    headers: HeaderMap,
-    uri: Uri,
 ) -> Result<Json<UrlResponse>, AppError> {
     load_owned_file(&state.pool, &ctx.owner, id).await?;
     let mut bytes = [0_u8; 32];
@@ -339,13 +348,9 @@ async fn publish_file(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("file {id}")));
     }
-    let scheme = uri.scheme_str().unwrap_or("http");
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::Validation("host header is required".into()))?;
+    let base = state.config.public_base_url.trim_end_matches('/');
     Ok(Json(UrlResponse {
-        url: format!("{scheme}://{host}/public/{key}"),
+        url: format!("{base}/public/{key}"),
     }))
 }
 

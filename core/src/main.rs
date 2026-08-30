@@ -93,7 +93,8 @@ async fn run() {
     }
 
     let jwks_cache = JwksCache::new(config.jwt_trusted_issuers.clone());
-    let files_routes = drive::files::files_router(&config);
+    let upload_routes = drive::files::upload_router(&config);
+    let files_routes = drive::files::files_router();
     let state = AppState {
         pool,
         s3: storage,
@@ -104,24 +105,30 @@ async fn run() {
 
     // Stateful routers merge first; state is baked in once at the end
     // (axum 0.8 lacks a Router<AppState> -> Router<()> late conversion).
+    // `upload_routes` is merged one level up so the 120 s request timeout
+    // never kills a large, slow upload; everything else stays capped.
     let app = axum::Router::<AppState>::new()
-        .merge(billing::status_handler::billing_status_router())
-        .merge(files_routes)
-        .nest("/v1/folders", drive::folders::folders_router())
-        .nest("/v1/admin", admin::admin_router())
-        .merge(public::public_router())
-        .merge(health::health_router())
-        .route("/openapi.json", get(|| async { Json(openapi_spec()) }))
-        .route("/docs", get(docs_redirect))
+        .merge(upload_routes)
         .merge(
-            utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
-                .url("/api-docs/openapi.json", openapi_spec()),
+            axum::Router::<AppState>::new()
+                .merge(billing::status_handler::billing_status_router())
+                .merge(files_routes)
+                .nest("/v1/folders", drive::folders::folders_router())
+                .nest("/v1/admin", admin::admin_router())
+                .merge(public::public_router())
+                .merge(health::health_router())
+                .route("/openapi.json", get(|| async { Json(openapi_spec()) }))
+                .route("/docs", get(docs_redirect))
+                .merge(
+                    utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
+                        .url("/api-docs/openapi.json", openapi_spec()),
+                )
+                .layer(TimeoutLayer::with_status_code(
+                    axum::http::StatusCode::REQUEST_TIMEOUT,
+                    Duration::from_secs(120),
+                )),
         )
         .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(120),
-        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
