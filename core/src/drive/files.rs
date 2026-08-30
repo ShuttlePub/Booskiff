@@ -128,7 +128,7 @@ pub fn files_router(config: &Config) -> Router<AppState> {
         )
 }
 
-#[utoipa::path(post, path = "/v1/files", tag = "files", responses((status = 201, body = FileResponse)))]
+#[utoipa::path(post, path = "/v1/files", tag = "files", security(("bearer_auth" = [])), responses((status = 201, body = FileResponse)))]
 async fn upload_file(
     ctx: AccountContext,
     State(state): State<AppState>,
@@ -213,7 +213,7 @@ async fn upload_file(
     response.map(|file| (StatusCode::CREATED, Json(file)))
 }
 
-#[utoipa::path(get, path = "/v1/files", tag = "files", responses((status = 200, body = FileListResponse)))]
+#[utoipa::path(get, path = "/v1/files", tag = "files", security(("bearer_auth" = [])), responses((status = 200, body = FileListResponse)))]
 async fn list_files(
     ctx: AccountContext,
     State(state): State<AppState>,
@@ -250,7 +250,7 @@ async fn list_files(
     Ok(Json(FileListResponse { items }))
 }
 
-#[utoipa::path(get, path = "/v1/files/{id}", tag = "files", params(("id" = Uuid, Path)), responses((status = 200, body = FileResponse), (status = 404)))]
+#[utoipa::path(get, path = "/v1/files/{id}", tag = "files", security(("bearer_auth" = [])), params(("id" = Uuid, Path)), responses((status = 200, body = FileResponse), (status = 404)))]
 async fn get_file(
     ctx: AccountContext,
     State(state): State<AppState>,
@@ -262,7 +262,7 @@ async fn get_file(
         .map(Json)
 }
 
-#[utoipa::path(delete, path = "/v1/files/{id}", tag = "files", params(("id" = Uuid, Path)), responses((status = 204), (status = 404)))]
+#[utoipa::path(delete, path = "/v1/files/{id}", tag = "files", security(("bearer_auth" = [])), params(("id" = Uuid, Path)), responses((status = 204), (status = 404)))]
 async fn delete_file(
     ctx: AccountContext,
     State(state): State<AppState>,
@@ -293,7 +293,7 @@ async fn delete_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(get, path = "/v1/files/{id}/download-url", tag = "files", params(("id" = Uuid, Path)), responses((status = 200, body = UrlResponse), (status = 404)))]
+#[utoipa::path(get, path = "/v1/files/{id}/download-url", tag = "files", security(("bearer_auth" = [])), params(("id" = Uuid, Path)), responses((status = 200, body = UrlResponse), (status = 404)))]
 async fn download_url(
     ctx: AccountContext,
     State(state): State<AppState>,
@@ -313,7 +313,7 @@ async fn download_url(
     Ok(Json(UrlResponse { url }))
 }
 
-#[utoipa::path(post, path = "/v1/files/{id}/publish", tag = "files", params(("id" = Uuid, Path)), responses((status = 200, body = UrlResponse), (status = 404)))]
+#[utoipa::path(post, path = "/v1/files/{id}/publish", tag = "files", security(("bearer_auth" = [])), params(("id" = Uuid, Path)), responses((status = 200, body = UrlResponse), (status = 404)))]
 async fn publish_file(
     ctx: AccountContext,
     State(state): State<AppState>,
@@ -349,7 +349,7 @@ async fn publish_file(
     }))
 }
 
-#[utoipa::path(delete, path = "/v1/files/{id}/publish", tag = "files", params(("id" = Uuid, Path)), responses((status = 204), (status = 404)))]
+#[utoipa::path(delete, path = "/v1/files/{id}/publish", tag = "files", security(("bearer_auth" = [])), params(("id" = Uuid, Path)), responses((status = 204), (status = 404)))]
 async fn unpublish_file(
     ctx: AccountContext,
     State(state): State<AppState>,

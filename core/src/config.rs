@@ -62,6 +62,9 @@ pub struct Config {
     pub plan_premium_rate_limit_rpm: u32,
     pub presigned_get_ttl_secs: u64,
     pub public_base_url: String,
+    /// Raw admin token seeded into `admin_tokens` (name `bootstrap`) on
+    /// startup when no active token with that hash exists yet.
+    pub admin_bootstrap_token: Option<String>,
 }
 
 impl Default for Config {
@@ -88,6 +91,7 @@ impl Default for Config {
             plan_premium_rate_limit_rpm: 300,
             presigned_get_ttl_secs: 900,
             public_base_url: "http://localhost:3000".into(),
+            admin_bootstrap_token: None,
         }
     }
 }
@@ -171,6 +175,10 @@ impl Config {
                 "presigned_get_ttl_secs",
             )?,
             public_base_url: override_str(d.public_base_url, "BOOSKIFF_PUBLIC_BASE_URL"),
+            admin_bootstrap_token: override_opt_str(
+                d.admin_bootstrap_token,
+                "BOOSKIFF_ADMIN_BOOTSTRAP_TOKEN",
+            ),
         })
     }
 }

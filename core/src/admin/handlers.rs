@@ -148,6 +148,7 @@ fn parse_plan(value: &str) -> Result<Plan, AppError> {
     post,
     path = "/v1/admin/tokens",
     tag = "admin",
+    security(("admin_token" = [])),
     request_body = CreateTokenRequest,
     responses(
         (status = 201, description = "Token created; the raw token is returned exactly once", body = CreatedAdminToken),
@@ -185,6 +186,7 @@ async fn create_token(
     get,
     path = "/v1/admin/tokens",
     tag = "admin",
+    security(("admin_token" = [])),
     responses(
         (status = 200, description = "All admin tokens without secret material", body = AdminTokenList),
         (status = 401, description = "Missing, unknown, or revoked admin token"),
@@ -218,6 +220,7 @@ async fn list_tokens(
     delete,
     path = "/v1/admin/tokens/{id}",
     tag = "admin",
+    security(("admin_token" = [])),
     params(("id" = Uuid, Path, description = "Admin token id")),
     responses(
         (status = 204, description = "Revoked; the token authenticates no longer"),
@@ -246,6 +249,7 @@ async fn revoke_token(
     get,
     path = "/v1/admin/billing/rules",
     tag = "admin",
+    security(("admin_token" = [])),
     responses(
         (status = 200, description = "All billing rules, global layer first", body = BillingRuleList),
         (status = 401, description = "Missing, unknown, or revoked admin token"),
@@ -267,6 +271,7 @@ async fn list_billing_rules(
     post,
     path = "/v1/admin/billing/rules",
     tag = "admin",
+    security(("admin_token" = [])),
     request_body = CreateRuleRequest,
     responses(
         (status = 200, description = "Rule inserted or updated", body = BillingRuleItem),
@@ -295,6 +300,7 @@ async fn create_billing_rule(
     delete,
     path = "/v1/admin/billing/rules/{id}",
     tag = "admin",
+    security(("admin_token" = [])),
     params(("id" = Uuid, Path, description = "Billing rule id")),
     responses(
         (status = 204, description = "Rule deleted"),
@@ -318,6 +324,7 @@ async fn delete_billing_rule(
     put,
     path = "/v1/admin/owners/{owner_type}/{owner_id}/plan",
     tag = "admin",
+    security(("admin_token" = [])),
     params(
         ("owner_type" = String, Path, description = "Owner type, e.g. account"),
         ("owner_id" = String, Path, description = "Owner id"),
@@ -344,6 +351,7 @@ async fn set_plan(
     get,
     path = "/v1/admin/owners/{owner_type}/{owner_id}/plan",
     tag = "admin",
+    security(("admin_token" = [])),
     params(
         ("owner_type" = String, Path, description = "Owner type, e.g. account"),
         ("owner_id" = String, Path, description = "Owner id"),
@@ -369,6 +377,7 @@ async fn get_plan(
     delete,
     path = "/v1/admin/owners/{owner_type}/{owner_id}/plan",
     tag = "admin",
+    security(("admin_token" = [])),
     params(
         ("owner_type" = String, Path, description = "Owner type, e.g. account"),
         ("owner_id" = String, Path, description = "Owner id"),
@@ -399,6 +408,7 @@ async fn delete_plan(
     get,
     path = "/v1/admin/owners/{owner_type}/{owner_id}/usage",
     tag = "admin",
+    security(("admin_token" = [])),
     params(
         ("owner_type" = String, Path, description = "Owner type, e.g. account"),
         ("owner_id" = String, Path, description = "Owner id"),

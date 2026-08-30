@@ -53,7 +53,7 @@ pub fn folders_router() -> Router<AppState> {
         )
 }
 
-#[utoipa::path(post, path = "/v1/folders", tag = "folders")]
+#[utoipa::path(post, path = "/v1/folders", tag = "folders", security(("bearer_auth" = [])))]
 async fn create_folder(
     context: AccountContext,
     State(state): State<AppState>,
@@ -73,7 +73,7 @@ async fn create_folder(
     Ok((StatusCode::CREATED, Json(folder_response(row)?)))
 }
 
-#[utoipa::path(get, path = "/v1/folders", tag = "folders")]
+#[utoipa::path(get, path = "/v1/folders", tag = "folders", security(("bearer_auth" = [])))]
 async fn list_folders(
     context: AccountContext,
     State(state): State<AppState>,
@@ -94,7 +94,7 @@ async fn list_folders(
     Ok(Json(FolderListResponse { items }))
 }
 
-#[utoipa::path(get, path = "/v1/folders/{id}", tag = "folders")]
+#[utoipa::path(get, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])))]
 async fn get_folder(
     context: AccountContext,
     State(state): State<AppState>,
@@ -104,7 +104,7 @@ async fn get_folder(
     Ok(Json(folder_response(row)?))
 }
 
-#[utoipa::path(patch, path = "/v1/folders/{id}", tag = "folders")]
+#[utoipa::path(patch, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])))]
 async fn rename_folder(
     context: AccountContext,
     State(state): State<AppState>,
@@ -127,7 +127,7 @@ async fn rename_folder(
     Ok(Json(folder_response(row)?))
 }
 
-#[utoipa::path(delete, path = "/v1/folders/{id}", tag = "folders")]
+#[utoipa::path(delete, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])))]
 async fn delete_folder(
     context: AccountContext,
     State(state): State<AppState>,

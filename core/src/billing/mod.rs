@@ -6,4 +6,5 @@ pub mod plans;
 pub mod provider;
 pub mod resolve;
 pub mod rules;
+pub mod status_handler;
 pub mod usage;

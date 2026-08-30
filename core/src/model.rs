@@ -1,7 +1,7 @@
 //! Core domain models shared across modules.
 
 /// Polymorphic owner reference (`owner_type:owner_id`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, utoipa::ToSchema)]
 pub struct Owner {
     pub owner_type: String,
     pub owner_id: String,
@@ -25,7 +25,7 @@ impl Owner {
 pub const OBJECT_KIND_ORIGINAL: &str = "original";
 
 /// Billing plan tiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, utoipa::ToSchema)]
 pub enum Plan {
     Default,
     Premium,
@@ -57,7 +57,7 @@ impl std::str::FromStr for Plan {
 }
 
 /// Effective limits for an owner after plan/billing resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, utoipa::ToSchema)]
 pub struct Limits {
     pub storage_quota_bytes: i64,
     pub max_file_bytes: i64,

@@ -31,12 +31,12 @@ pub enum AppError {
 }
 
 /// JSON body shape: `{"error":{"code":...,"message":...}}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ErrorBody {
     pub error: ErrorDetail,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ErrorDetail {
     pub code: &'static str,
     pub message: String,

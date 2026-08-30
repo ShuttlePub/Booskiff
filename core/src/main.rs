@@ -1,11 +1,17 @@
 use axum::Json;
+use axum::response::Redirect;
 use axum::routing::get;
 use core::api_doc::openapi_spec;
+use core::auth::admin_auth::{find_active_by_hash, hash_admin_token};
 use core::auth::jwks::JwksCache;
 use core::config::Config;
+use core::error::AppError;
 use core::state::{AppState, RateLimiters};
-use core::{health, storage::Storage};
+use core::{admin, billing, drive, health, public, storage::Storage};
 use std::sync::Arc;
+use std::time::Duration;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
 
 fn main() {
     // The process-wide aws-lc-rs provider must be installed before any
@@ -15,8 +21,8 @@ fn main() {
         .ok();
 
     if std::env::args().nth(1).as_deref() == Some("openapi") {
-        match serde_json::to_string_pretty(&openapi_spec()) {
-            Ok(spec) => println!("{spec}"),
+        match openapi_spec().to_json() {
+            Ok(spec) => print!("{spec}"),
             Err(err) => {
                 eprintln!("failed to serialize openapi spec: {err}");
                 std::process::exit(1);
@@ -67,6 +73,12 @@ async fn run() {
         eprintln!("failed to run database migrations: {err}");
         std::process::exit(1);
     }
+    if let Some(token) = &config.admin_bootstrap_token
+        && let Err(err) = seed_bootstrap_admin_token(&pool, token).await
+    {
+        eprintln!("failed to seed bootstrap admin token: {err}");
+        std::process::exit(1);
+    }
 
     let storage = match Storage::build(&config).await {
         Ok(storage) => storage,
@@ -81,6 +93,7 @@ async fn run() {
     }
 
     let jwks_cache = JwksCache::new(config.jwt_trusted_issuers.clone());
+    let files_routes = drive::files::files_router(&config);
     let state = AppState {
         pool,
         s3: storage,
@@ -92,12 +105,23 @@ async fn run() {
     // Stateful routers merge first; state is baked in once at the end
     // (axum 0.8 lacks a Router<AppState> -> Router<()> late conversion).
     let app = axum::Router::<AppState>::new()
+        .merge(billing::status_handler::billing_status_router())
+        .merge(files_routes)
+        .nest("/v1/folders", drive::folders::folders_router())
+        .nest("/v1/admin", admin::admin_router())
+        .merge(public::public_router())
         .merge(health::health_router())
         .route("/openapi.json", get(|| async { Json(openapi_spec()) }))
+        .route("/docs", get(docs_redirect))
         .merge(
             utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
                 .url("/api-docs/openapi.json", openapi_spec()),
         )
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(120),
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
@@ -111,4 +135,26 @@ async fn run() {
         eprintln!("server error: {err}");
         std::process::exit(1);
     }
+}
+
+/// Seed `config.admin_bootstrap_token` as an active `admin_tokens` row
+/// (name `bootstrap`) unless an active token with that hash already
+/// exists, making restarts with the same environment idempotent.
+async fn seed_bootstrap_admin_token(pool: &sqlx::PgPool, token: &str) -> Result<(), AppError> {
+    let token_hash = hash_admin_token(token);
+    if find_active_by_hash(pool, &token_hash).await?.is_some() {
+        tracing::info!("bootstrap admin token already seeded");
+        return Ok(());
+    }
+    sqlx::query("INSERT INTO admin_tokens (name, token_hash) VALUES ('bootstrap', $1) ON CONFLICT (name) DO UPDATE SET token_hash = EXCLUDED.token_hash, revoked_at = NULL")
+        .bind(&token_hash)
+        .execute(pool)
+        .await
+        .map_err(|err| AppError::Internal(format!("seed bootstrap admin token: {err}")))?;
+    tracing::info!("seeded bootstrap admin token");
+    Ok(())
+}
+
+async fn docs_redirect() -> Redirect {
+    Redirect::to("/swagger-ui/")
 }

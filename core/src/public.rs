@@ -29,6 +29,16 @@ pub fn public_router() -> Router<AppState> {
     Router::new().route("/public/{key}", get(get_public_file))
 }
 
+#[utoipa::path(
+    get,
+    path = "/public/{key}",
+    tag = "public",
+    params(("key" = String, Path, description = "Public key of a published file")),
+    responses(
+        (status = 200, description = "The file content, served with immutable caching"),
+        (status = 404, description = "Unknown or unpublished key"),
+    )
+)]
 async fn get_public_file(
     State(state): State<AppState>,
     Path(key): Path<String>,
