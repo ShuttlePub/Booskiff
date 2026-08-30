@@ -89,17 +89,16 @@ async fn run() {
         rate_limiters: Arc::new(RateLimiters::default()),
     };
 
-    // Wave-1 mounts only stateless routes; state is baked in up front.
-    // Wave 2+ restructures as stateful routers land (axum 0.8 lacks a
-    // From<Router<()>> for Router<S> conversion for late merges).
+    // Stateful routers merge first; state is baked in once at the end
+    // (axum 0.8 lacks a Router<AppState> -> Router<()> late conversion).
     let app = axum::Router::<AppState>::new()
-        .with_state(state)
         .merge(health::health_router())
         .route("/openapi.json", get(|| async { Json(openapi_spec()) }))
         .merge(
             utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
                 .url("/api-docs/openapi.json", openapi_spec()),
-        );
+        )
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await

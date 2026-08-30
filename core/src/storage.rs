@@ -107,6 +107,17 @@ impl Storage {
         }
     }
 
+    /// Check that the configured bucket is reachable without creating it.
+    pub async fn check_ready(&self) -> Result<(), AppError> {
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|err| AppError::Internal(format!("head bucket {}: {err}", self.bucket)))
+    }
+
     /// Upload `body` to `key`.
     ///
     /// `content_length` is forwarded explicitly: the SDK needs a known
