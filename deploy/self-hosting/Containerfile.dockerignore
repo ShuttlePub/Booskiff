@@ -1,0 +1,9 @@
+# Build-context exclusions for deploy/self-hosting/Containerfile only
+# (BuildKit per-Dockerfile ignore file; leaves the repo-root .dockerignore
+# untouched). Keeps the 6.5G target/ dir and unrelated files out of the
+# context sent to the daemon.
+target/
+.git
+.codegraph
+.omo/
+e2e/
