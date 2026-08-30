@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -29,6 +32,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
       - run: cargo test
@@ -38,6 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p core -- openapi > openapi.json
       - run: git diff --exit-code openapi.json
@@ -47,6 +54,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - run: docker compose version
       - run: bash e2e/run-e2e.sh
 
   image:
