@@ -1,0 +1,52 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Doctests are disabled because rustdoc links this crate as `core`,
+# shadowing the builtin `core` paths that derive macros generate (the
+# package itself must be named `core`).
+[lib]
+doctest = false
+
+[[bin]]
+name = "core"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "limit", "timeout"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "macros", "migrate", "uuid", "time", "json"] }
+aws-config = { version = "1.8", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.144"
+aws-smithy-types = { version = "1.6", features = ["http-body-1-x"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+utoipa = { version = "5.5", features = ["axum_extras", "uuid", "time"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum", "vendored"] }
+governor = "0.10"
+uuid = { version = "1", features = ["v7", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+sha2 = "0.10"
+rand = "0.10"
+base64 = "0.22"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+
+[dev-dependencies]
+rstest = "0.26"
+http-body-util = "0.1"
+http-body = "1"

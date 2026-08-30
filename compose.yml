@@ -1,0 +1,47 @@
+# Dev/E2E infrastructure: Postgres + MinIO (S3-compatible).
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: booskiff
+      POSTGRES_PASSWORD: booskiff
+      POSTGRES_DB: booskiff
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booskiff -d booskiff"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: booskiff
+      MINIO_ROOT_PASSWORD: booskiff-secret
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Create the dev bucket once MinIO is healthy; always exits 0 so the
+  # compose project reports healthy even when the bucket already exists.
+  mc-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "sleep 2 && mc alias set local http://minio:9000 booskiff booskiff-secret && (mc mb -p local/booskiff-default || true)"]
+
+volumes:
+  pgdata:
+  miniodata:
