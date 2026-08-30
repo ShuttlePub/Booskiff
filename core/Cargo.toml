@@ -28,6 +28,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.144"
 aws-smithy-types = { version = "1.6", features = ["http-body-1-x"] }
+http-body = "1"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -49,4 +50,3 @@ dotenvy = "0.15"
 [dev-dependencies]
 rstest = "0.26"
 http-body-util = "0.1"
-http-body = "1"
