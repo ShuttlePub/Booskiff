@@ -1,9 +1,6 @@
-//! Admin API surface. TODO(Wave3): token-authenticated management routes
-//! (admin users, billing rules, plan assignments).
+//! Admin API surface: token lifecycle, billing rules, plan assignments,
+//! and owner usage, authenticated by `X-Admin-Token` (see `auth::admin_auth`).
 
-use axum::Router;
+pub mod handlers;
 
-/// Admin router — placeholder until Wave-3 adds routes.
-pub fn admin_router() -> Router<()> {
-    Router::new()
-}
+pub use handlers::admin_router;
