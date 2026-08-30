@@ -1,0 +1,6 @@
+# Reverse proxy for the self-hosting stack: Caddy listens on :80 inside the
+# compose network and is published as 127.0.0.1:18080 on the host.
+# reverse_proxy preserves the original Host header by default.
+:80 {
+	reverse_proxy core:8080
+}

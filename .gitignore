@@ -1,0 +1,9 @@
+/target
+*.log
+logs/
+.env
+.direnv
+.idea
+.vscode
+e2e/.tmp
+*.tmp

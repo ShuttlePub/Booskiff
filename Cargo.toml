@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["core"]
+
+[workspace.lints.clippy]
+all = { level = "warn" }
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+repository = "https://github.com/ShuttlePub/Booskiff"

@@ -1,0 +1,112 @@
+# Self-hosting stack: core + Postgres + MinIO + Caddy reverse proxy.
+#
+# Everything is on the internal compose network; the only published port is
+# Caddy on 127.0.0.1:18080. The dev stack in the repo-root compose.yml owns
+# host ports 5432/9000, so this project publishes nothing else (project name
+# booskiff-sh also keeps volumes/images separate from the dev stack).
+#
+# Configuration: copy .env.example to .env next to this file and edit.
+# Every value below has a working default, so the stack also runs with no
+# .env at all. `${VAR:-default}` means empty values in .env fall back to the
+# default, matching core's own empty-means-unset handling.
+name: booskiff-sh
+
+services:
+  core:
+    build:
+      context: ../..
+      dockerfile: deploy/self-hosting/Containerfile
+    environment:
+      # Keep POSTGRES_* below and the credentials in this URL in sync.
+      BOOSKIFF_DATABASE_URL: ${BOOSKIFF_DATABASE_URL:-postgres://booskiff:changeme@postgres:5432/booskiff}
+      # Keep 8080 to match EXPOSE and the healthcheck target.
+      BOOSKIFF_LISTEN_ADDR: ${BOOSKIFF_LISTEN_ADDR:-0.0.0.0:8080}
+      BOOSKIFF_S3_ENDPOINT: ${BOOSKIFF_S3_ENDPOINT:-http://minio:9000}
+      # Empty = build presigned URLs from BOOSKIFF_S3_ENDPOINT (internal-only).
+      BOOSKIFF_S3_ENDPOINT_PUBLIC: ${BOOSKIFF_S3_ENDPOINT_PUBLIC:-}
+      BOOSKIFF_S3_REGION: ${BOOSKIFF_S3_REGION:-us-east-1}
+      BOOSKIFF_S3_BUCKET: ${BOOSKIFF_S3_BUCKET:-booskiff-default}
+      # Keep MINIO_ROOT_* below and these credentials in sync.
+      BOOSKIFF_S3_ACCESS_KEY: ${BOOSKIFF_S3_ACCESS_KEY:-booskiff}
+      BOOSKIFF_S3_SECRET_KEY: ${BOOSKIFF_S3_SECRET_KEY:-booskiff-secret}
+      BOOSKIFF_JWT_TRUSTED_ISSUERS: ${BOOSKIFF_JWT_TRUSTED_ISSUERS:-}
+      BOOSKIFF_JWT_AUDIENCE: ${BOOSKIFF_JWT_AUDIENCE:-}
+      BOOSKIFF_JWT_OWNER_TYPE_CLAIM: ${BOOSKIFF_JWT_OWNER_TYPE_CLAIM:-owner_type}
+      BOOSKIFF_PREMIUM_MODE: ${BOOSKIFF_PREMIUM_MODE:-everyone}
+      BOOSKIFF_PAYMENT_PROVIDER: ${BOOSKIFF_PAYMENT_PROVIDER:-disabled}
+      BOOSKIFF_PLAN_DEFAULT_STORAGE_QUOTA_BYTES: ${BOOSKIFF_PLAN_DEFAULT_STORAGE_QUOTA_BYTES:-1073741824}
+      BOOSKIFF_PLAN_DEFAULT_MAX_FILE_BYTES: ${BOOSKIFF_PLAN_DEFAULT_MAX_FILE_BYTES:-104857600}
+      BOOSKIFF_PLAN_DEFAULT_RATE_LIMIT_RPM: ${BOOSKIFF_PLAN_DEFAULT_RATE_LIMIT_RPM:-100}
+      BOOSKIFF_PLAN_PREMIUM_STORAGE_QUOTA_BYTES: ${BOOSKIFF_PLAN_PREMIUM_STORAGE_QUOTA_BYTES:-10737418240}
+      BOOSKIFF_PLAN_PREMIUM_MAX_FILE_BYTES: ${BOOSKIFF_PLAN_PREMIUM_MAX_FILE_BYTES:-524288000}
+      BOOSKIFF_PLAN_PREMIUM_RATE_LIMIT_RPM: ${BOOSKIFF_PLAN_PREMIUM_RATE_LIMIT_RPM:-300}
+      BOOSKIFF_PRESIGNED_GET_TTL_SECS: ${BOOSKIFF_PRESIGNED_GET_TTL_SECS:-900}
+      BOOSKIFF_PUBLIC_BASE_URL: ${BOOSKIFF_PUBLIC_BASE_URL:-http://127.0.0.1:18080}
+      BOOSKIFF_ADMIN_BOOTSTRAP_TOKEN: ${BOOSKIFF_ADMIN_BOOTSTRAP_TOKEN:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-booskiff}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-booskiff}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-booskiff} -d ${POSTGRES_DB:-booskiff}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-booskiff}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-booskiff-secret}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot bucket bootstrap, mirroring the dev compose.yml init approach.
+  # Always exits 0; core also self-creates the bucket on startup, so the
+  # ordering between this and core does not matter.
+  mc-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "sleep 2 && mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-booskiff} ${MINIO_ROOT_PASSWORD:-booskiff-secret} && (mc mb -p local/${BOOSKIFF_S3_BUCKET:-booskiff-default} || true)"]
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "127.0.0.1:18080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - core
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  miniodata:

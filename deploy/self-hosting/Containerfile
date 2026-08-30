@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+# Multi-stage build for the Booskiff core binary.
+# Builder installs cmake+perl because aws-lc-rs (used by sqlx/rustls/jsonwebtoken
+# TLS) compiles its bundled C sources from source; build-essential provides the
+# C toolchain, pkg-config is probed by some transitive build scripts.
+
+# -bookworm: the plain 1.97-slim tag is trixie-based; the binary must link
+# against the bookworm glibc that the runtime stage below ships.
+FROM rust:1.97-slim-bookworm AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential cmake perl pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+# Workspace inputs only: manifests, lockfile, toolchain pin, the core crate and
+# the checked-in OpenAPI spec. The heavy target/ dir stays out of the build
+# context via Containerfile.dockerignore.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml openapi.json ./
+COPY core ./core
+# Cache mounts persist downloaded crates across builds. Deliberately NO
+# cache mount on target/: a cached binary survives base-image changes that
+# cargo's fingerprints cannot see, which shipped a glibc-incompatible binary
+# once already. A full recompile is cheap (~1 minute).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release --locked -p core
+
+FROM debian:bookworm-slim
+# ca-certificates: JWKS fetch and presigned URLs against HTTPS endpoints.
+# curl: container healthcheck (/readyz).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --user-group --shell /usr/sbin/nologin booskiff
+COPY --from=builder /app/target/release/core /usr/local/bin/core
+USER booskiff
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/core"]
