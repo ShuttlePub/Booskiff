@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aws_smithy_types::body::SdkBody;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AccountContext;
 use crate::billing::usage::{add_used_bytes, subtract_used_bytes, used_bytes};
-use crate::config::Config;
 use crate::error::AppError;
 use crate::model::{OBJECT_KIND_ORIGINAL, Owner};
 use crate::state::AppState;
@@ -29,7 +28,6 @@ use super::upload_body::CountingBody;
 
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
-const BODY_LIMIT_SLACK: i64 = 1024 * 1024;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct FileResponse {
@@ -108,15 +106,10 @@ impl FileRow {
     }
 }
 
-pub fn upload_router(config: &Config) -> Router<AppState> {
-    let body_limit_i64 = config
-        .plan_premium_max_file_bytes
-        .saturating_add(BODY_LIMIT_SLACK);
-    let body_limit = usize::try_from(body_limit_i64).unwrap_or(usize::MAX);
-    Router::new().route(
-        "/v1/files",
-        post(upload_file).route_layer(DefaultBodyLimit::max(body_limit)),
-    )
+/// CountingBody in upload_file is the sole body-size enforcement path.
+/// DefaultBodyLimit would be a no-op because upload_file extracts Body directly.
+pub fn upload_router() -> Router<AppState> {
+    Router::new().route("/v1/files", post(upload_file))
 }
 
 pub fn files_router() -> Router<AppState> {
@@ -140,8 +133,8 @@ async fn upload_file(
 ) -> Result<(StatusCode, Json<FileResponse>), AppError> {
     let name = query
         .name
-        .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| AppError::Validation("file name is required".into()))?;
+    super::validate_name(&name, "file")?;
     let mime = query
         .mime
         .filter(|mime| !mime.trim().is_empty())
@@ -393,6 +386,12 @@ fn parse_content_length(headers: &HeaderMap) -> Result<i64, AppError> {
     Ok(declared)
 }
 
+/// Checks folder ownership only; it does not create folders.
+///
+/// The originally reviewed concurrent-folder-creation race therefore does not
+/// exist in this code. The live race is folder deletion after this check but
+/// before the file INSERT; the resulting FK violation is mapped to `NotFound`
+/// by `map_insert_file_error` and covered by both vanished-folder tests below.
 async fn ensure_owned_folder(
     pool: &sqlx::PgPool,
     owner: &Owner,
@@ -457,7 +456,7 @@ async fn persist_uploaded_file(
     .bind(upload.size_bytes)
     .fetch_one(&mut *tx)
     .await
-    .map_err(|err| AppError::Internal(format!("insert file: {err}")))?;
+    .map_err(|err| map_insert_file_error(err, upload.folder_id))?;
     sqlx::query(
         "INSERT INTO file_objects \
          (file_id, object_kind, storage_key, size_bytes, mime_type) VALUES ($1, $2, $3, $4, $5)",
@@ -486,9 +485,213 @@ async fn persist_uploaded_file(
     Ok(response)
 }
 
+fn map_insert_file_error(error: sqlx::Error, folder_id: Option<Uuid>) -> AppError {
+    match (&error, folder_id) {
+        (sqlx::Error::Database(database_error), Some(folder_id))
+            if database_error.code().as_deref() == Some("23503") =>
+        {
+            AppError::NotFound(format!("folder {folder_id}"))
+        }
+        _ => AppError::Internal(format!("insert file: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn upload_returns_413_when_declared_length_exceeds_limit() {
+        // Given: a closed pool makes any database access fail.
+        let config = Config::default();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        pool.close().await;
+        let storage = Storage::build(&config).await.unwrap();
+        let state = test_state(config, pool, storage).await;
+        let ctx = AccountContext {
+            owner: Owner::new("test-files", Uuid::now_v7().to_string()),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 4,
+                rate_limit_rpm: 100,
+            },
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "5".parse().unwrap());
+
+        // When
+        let error = upload_file(
+            ctx,
+            State(state),
+            Query(UploadQuery {
+                name: Some("large.txt".into()),
+                mime: None,
+                folder_id: None,
+            }),
+            headers,
+            Body::empty(),
+        )
+        .await
+        .unwrap_err();
+
+        // Then
+        assert!(matches!(error, AppError::PayloadTooLarge(_)));
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires compose postgres and MinIO"]
+    async fn upload_returns_413_when_actual_body_exceeds_limit() {
+        // Given: the declared length fits exactly, but the body exceeds the cap.
+        let config = Config::default();
+        let pool = test_pool().await;
+        let storage = Storage::build(&config).await.unwrap();
+        storage.ensure_bucket().await.unwrap();
+        let state = test_state(config, pool, storage).await;
+        let ctx = AccountContext {
+            owner: Owner::new("test-files", Uuid::now_v7().to_string()),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 4,
+                rate_limit_rpm: 100,
+            },
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "4".parse().unwrap());
+
+        // When
+        let error = upload_file(
+            ctx,
+            State(state),
+            Query(UploadQuery {
+                name: Some("large.txt".into()),
+                mime: None,
+                folder_id: None,
+            }),
+            headers,
+            Body::from("12345"),
+        )
+        .await
+        .unwrap_err();
+
+        // Then
+        assert!(matches!(error, AppError::PayloadTooLarge(_)));
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose postgres stack"]
+    async fn pg_upload_into_vanished_folder_is_not_found() {
+        // Given: the folder ID does not exist in PostgreSQL.
+        let config = Config::default();
+        let pool = test_pool().await;
+        let storage = Storage::build(&config).await.unwrap();
+        let state = test_state(config, pool, storage).await;
+        let folder_id = Uuid::now_v7();
+        let ctx = AccountContext {
+            owner: Owner::new("test-drive-files", Uuid::now_v7().to_string()),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 1024,
+                rate_limit_rpm: 100,
+            },
+        };
+
+        // When
+        let error = persist_uploaded_file(
+            &state,
+            &ctx,
+            UploadedFile {
+                id: Uuid::now_v7(),
+                folder_id: Some(folder_id),
+                name: "vanished-folder.txt".into(),
+                mime: "text/plain".into(),
+                key: "test-drive-files/vanished-folder.txt".into(),
+                size_bytes: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        // Then
+        assert!(matches!(error, AppError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose postgres stack"]
+    async fn pg_concurrent_folder_delete_and_upload_never_500() {
+        // Given: an owner and a real folder in PostgreSQL.
+        let config = Config::default();
+        let pool = test_pool().await;
+        let storage = Storage::build(&config).await.unwrap();
+        let owner = Owner::new("test-drive-files-race", Uuid::now_v7().to_string());
+        let ctx = AccountContext {
+            owner: owner.clone(),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 1024,
+                rate_limit_rpm: 100,
+            },
+        };
+        let state = test_state(config, pool.clone(), storage).await;
+
+        for round in 0..8 {
+            let folder_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO folders (owner_type, owner_id, name) VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(&owner.owner_type)
+            .bind(&owner.owner_id)
+            .bind(format!("race-{round}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            // When: file INSERT and folder DELETE run concurrently.
+            let (upload_result, delete_result) = tokio::join!(
+                persist_uploaded_file(
+                    &state,
+                    &ctx,
+                    UploadedFile {
+                        id: Uuid::now_v7(),
+                        folder_id: Some(folder_id),
+                        name: format!("race-{round}.txt"),
+                        mime: "text/plain".into(),
+                        key: format!("test-drive-files/race-{round}.txt"),
+                        size_bytes: 1,
+                    },
+                ),
+                sqlx::query("DELETE FROM folders WHERE id = $1")
+                    .bind(folder_id)
+                    .execute(&pool),
+            );
+
+            delete_result.unwrap();
+
+            // Then: deletion may win (404) or insertion may win (success), but
+            // the FK race must never escape as an internal error (500).
+            match upload_result {
+                Ok(_) | Err(AppError::NotFound(_)) => {}
+                Err(error) => panic!("concurrent upload returned unexpected error: {error:?}"),
+            }
+
+            sqlx::query("DELETE FROM files WHERE owner_type = $1 AND owner_id = $2")
+                .bind(&owner.owner_type)
+                .bind(&owner.owner_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
 
     #[test]
     fn foreign_file_row_maps_to_not_found() {
@@ -589,11 +792,17 @@ mod tests {
 
     async fn test_state(config: Config, pool: sqlx::PgPool, s3: Storage) -> AppState {
         AppState {
+            billing_cache: std::sync::Arc::new(crate::billing::cache::BillingCache::new(
+                config.billing_cache_ttl_secs,
+            )),
             jwks_cache: crate::auth::jwks::JwksCache::new(config.jwt_trusted_issuers.clone()),
             pool,
             s3,
             config,
             rate_limiters: std::sync::Arc::new(crate::state::RateLimiters::default()),
+            public_rate_limiter: std::sync::Arc::new(
+                crate::auth::rate_limit::PublicRateLimiter::new(300),
+            ),
         }
     }
 

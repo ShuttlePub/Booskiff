@@ -53,6 +53,7 @@ pub struct Config {
     pub jwt_owner_type_claim: String,
     pub listen_addr: String,
     pub premium_mode: PremiumMode,
+    pub billing_cache_ttl_secs: u64,
     pub payment_provider: PaymentProviderCfg,
     pub plan_default_storage_quota_bytes: i64,
     pub plan_default_max_file_bytes: i64,
@@ -62,6 +63,8 @@ pub struct Config {
     pub plan_premium_rate_limit_rpm: u32,
     pub presigned_get_ttl_secs: u64,
     pub public_base_url: String,
+    pub public_rate_limit_rpm: u32,
+    pub trust_proxy_headers: bool,
     /// Raw admin token seeded into `admin_tokens` (name `bootstrap`) on
     /// startup when no active token with that hash exists yet.
     pub admin_bootstrap_token: Option<String>,
@@ -82,6 +85,7 @@ impl Default for Config {
             jwt_owner_type_claim: "owner_type".into(),
             listen_addr: "0.0.0.0:3000".into(),
             premium_mode: PremiumMode::Everyone,
+            billing_cache_ttl_secs: 60,
             payment_provider: PaymentProviderCfg::Disabled,
             plan_default_storage_quota_bytes: 1024 * 1024 * 1024,
             plan_default_max_file_bytes: 100 * 1024 * 1024,
@@ -91,6 +95,8 @@ impl Default for Config {
             plan_premium_rate_limit_rpm: 300,
             presigned_get_ttl_secs: 900,
             public_base_url: "http://localhost:3000".into(),
+            public_rate_limit_rpm: 300,
+            trust_proxy_headers: false,
             admin_bootstrap_token: None,
         }
     }
@@ -127,6 +133,11 @@ impl Config {
                 "BOOSKIFF_JWT_OWNER_TYPE_CLAIM",
             ),
             listen_addr: override_str(d.listen_addr, "BOOSKIFF_LISTEN_ADDR"),
+            billing_cache_ttl_secs: override_parse(
+                d.billing_cache_ttl_secs,
+                "BOOSKIFF_BILLING_CACHE_TTL_SECS",
+                "billing_cache_ttl_secs",
+            )?,
             premium_mode: parse_premium_mode(
                 "BOOSKIFF_PREMIUM_MODE",
                 std::env::var("BOOSKIFF_PREMIUM_MODE")
@@ -175,10 +186,20 @@ impl Config {
                 "presigned_get_ttl_secs",
             )?,
             public_base_url: override_str(d.public_base_url, "BOOSKIFF_PUBLIC_BASE_URL"),
+            public_rate_limit_rpm: override_parse(
+                d.public_rate_limit_rpm,
+                "BOOSKIFF_PUBLIC_RATE_LIMIT_RPM",
+                "public_rate_limit_rpm",
+            )?,
             admin_bootstrap_token: override_opt_str(
                 d.admin_bootstrap_token,
                 "BOOSKIFF_ADMIN_BOOTSTRAP_TOKEN",
             ),
+            trust_proxy_headers: override_parse(
+                d.trust_proxy_headers,
+                "BOOSKIFF_TRUST_PROXY_HEADERS",
+                "trust_proxy_headers",
+            )?,
         })
     }
 }
@@ -271,6 +292,12 @@ fn parse_payment_provider(
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn public_rate_limit_defaults_to_300_when_config_is_default() {
+        // Given no overrides; when constructing defaults; then pin the documented quota.
+        assert_eq!(Config::default().public_rate_limit_rpm, 300);
+    }
 
     #[rstest]
     #[case(

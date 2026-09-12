@@ -5,7 +5,7 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 
 use crate::auth::jwt::{owner_from_claims, verify_token};
-use crate::billing::resolve::effective_limits;
+use crate::billing::resolve::effective_limits_cached;
 use crate::error::AppError;
 use crate::model::{Limits, Owner};
 use crate::state::AppState;
@@ -30,9 +30,10 @@ impl FromRequestParts<AppState> for AccountContext {
             .map_err(|err| err.into_response())?;
         let owner = owner_from_claims(&claims, &state.config.jwt_owner_type_claim)
             .map_err(|err| err.into_response())?;
-        let limits = effective_limits(&state.pool, &state.config, &owner)
-            .await
-            .map_err(|err| err.into_response())?;
+        let limits =
+            effective_limits_cached(&state.billing_cache, &state.pool, &state.config, &owner)
+                .await
+                .map_err(|err| err.into_response())?;
         if !state
             .rate_limiters
             .check(&owner.key(), limits.rate_limit_rpm)
@@ -122,8 +123,8 @@ mod tests {
     }
 
     /// Compose postgres (compose.yml), required by the DB-backed tests:
-    /// the billing `effective_limits` resolution queries `billing_rules`
-    /// on every request, so the 200/429 paths need a live database.
+    /// billing cache misses query `billing_rules`, so the 200/429 paths
+    /// need a live database.
     const PUBLISH_DB_URL: &str = "postgres://booskiff:booskiff@127.0.0.1:5432/booskiff";
 
     /// Router state for the DB-free paths (header parsing and token
@@ -144,8 +145,12 @@ mod tests {
                 .expect("lazy pool never connects"),
             s3: Storage::build(&config).await.unwrap(),
             jwks_cache: JwksCache::new(config.jwt_trusted_issuers.clone()),
+            billing_cache: Arc::new(crate::billing::cache::BillingCache::new(
+                config.billing_cache_ttl_secs,
+            )),
             config,
             rate_limiters: Arc::new(RateLimiters::default()),
+            public_rate_limiter: Arc::new(crate::auth::rate_limit::PublicRateLimiter::new(300)),
         }
     }
 
@@ -168,8 +173,12 @@ mod tests {
             pool: sqlx::PgPool::connect(PUBLISH_DB_URL).await.unwrap(),
             s3: Storage::build(&config).await.unwrap(),
             jwks_cache: JwksCache::new(config.jwt_trusted_issuers.clone()),
+            billing_cache: Arc::new(crate::billing::cache::BillingCache::new(
+                config.billing_cache_ttl_secs,
+            )),
             config,
             rate_limiters: Arc::new(RateLimiters::default()),
+            public_rate_limiter: Arc::new(crate::auth::rate_limit::PublicRateLimiter::new(300)),
         }
     }
 

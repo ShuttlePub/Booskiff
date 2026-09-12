@@ -48,9 +48,8 @@ pub async fn list_rules(pool: &sqlx::PgPool) -> Result<Vec<BillingRule>, AppErro
 /// Insert or update the rule for (`scope`, `key`). `scope = None` targets
 /// the global layer.
 ///
-/// Manual two-step upsert: the unique constraint is an expression index
-/// over `COALESCE(owner_type,''), COALESCE(owner_id,''), key`, which plain
-/// `ON CONFLICT` cannot target in text queries.
+/// Upserts a rule using `billing_rules_scope_key_uq` as an expression-index
+/// arbiter; the double parentheses enable PostgreSQL expression inference.
 pub async fn upsert_rule(
     pool: &sqlx::PgPool,
     scope: Option<&Owner>,
@@ -73,37 +72,11 @@ pub async fn upsert_rule(
         None => (None, None),
     };
 
-    let mut update = sqlx::query_as::<_, BillingRule>(
-        "UPDATE billing_rules SET value = $3, enabled = $4 \
-         WHERE key = $5 \
-           AND ((owner_type IS NULL AND $1::text IS NULL) OR owner_type = $1) \
-           AND ((owner_id IS NULL AND $2::text IS NULL) OR owner_id = $2) \
-         RETURNING id, owner_type, owner_id, key, value, enabled, created_at",
-    );
-    match scope {
-        Some(owner) => {
-            update = update.bind(&owner.owner_type).bind(&owner.owner_id);
-        }
-        None => {
-            update = update
-                .bind(Option::<String>::None)
-                .bind(Option::<String>::None);
-        }
-    }
-    let updated = update
-        .bind(&value)
-        .bind(enabled)
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| AppError::Internal(format!("update billing rule failed: {err}")))?;
-    if let Some(rule) = updated {
-        return Ok(rule);
-    }
-
     sqlx::query_as::<_, BillingRule>(
         "INSERT INTO billing_rules (owner_type, owner_id, key, value, enabled) \
          VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT ((COALESCE(owner_type, '')), (COALESCE(owner_id, '')), key) \
+         DO UPDATE SET value = EXCLUDED.value, enabled = EXCLUDED.enabled \
          RETURNING id, owner_type, owner_id, key, value, enabled, created_at",
     )
     .bind(owner_type)
@@ -252,6 +225,60 @@ mod tests {
         .await
         .expect("numeric string rule");
         assert_eq!(numeric.value, serde_json::json!("4096"));
+
+        cleanup(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose postgres stack"]
+    async fn pg_concurrent_upserts_do_not_conflict() {
+        let pool = test_pool().await;
+        let owner = Owner::new("test-billing-rules", Uuid::now_v7().to_string());
+        cleanup(&pool, &owner).await;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for value in 0..8 {
+            let pool = pool.clone();
+            let owner = owner.clone();
+            tasks.spawn(async move {
+                upsert_rule(
+                    &pool,
+                    Some(&owner),
+                    "max_file_bytes",
+                    serde_json::json!(value),
+                    true,
+                )
+                .await
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            results.push(result.expect("upsert task panicked"));
+        }
+
+        assert!(results.iter().all(Result::is_ok));
+        let rules: Vec<BillingRule> = results
+            .into_iter()
+            .map(|result| result.expect("concurrent upsert failed"))
+            .collect();
+        let first_id = rules[0].id;
+        assert!(rules.iter().all(|rule| rule.id == first_id));
+        assert!(
+            rules
+                .iter()
+                .all(|rule| (0..8).any(|value| rule.value == serde_json::json!(value)))
+        );
+        let stored_value: serde_json::Value = sqlx::query_scalar(
+            "SELECT value FROM billing_rules WHERE owner_type = $1 AND owner_id = $2 AND key = $3",
+        )
+        .bind(&owner.owner_type)
+        .bind(&owner.owner_id)
+        .bind("max_file_bytes")
+        .fetch_one(&pool)
+        .await
+        .expect("stored concurrent upsert value");
+        assert!((0..8).any(|value| stored_value == serde_json::json!(value)));
 
         cleanup(&pool, &owner).await;
     }

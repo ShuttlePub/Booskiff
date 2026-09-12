@@ -131,7 +131,19 @@ fn owner_scope(
 ) -> Result<Option<Owner>, AppError> {
     match (owner_type, owner_id) {
         (None, None) => Ok(None),
-        (Some(owner_type), Some(owner_id)) => Ok(Some(Owner::new(owner_type, owner_id))),
+        (Some(owner_type), Some(owner_id)) => {
+            if owner_type.trim().is_empty() {
+                return Err(AppError::Validation(
+                    "owner_type must not be blank".to_owned(),
+                ));
+            }
+            if owner_id.trim().is_empty() {
+                return Err(AppError::Validation(
+                    "owner_id must not be blank".to_owned(),
+                ));
+            }
+            Ok(Some(Owner::new(owner_type, owner_id)))
+        }
         (Some(_), None) | (None, Some(_)) => Err(AppError::Validation(
             "owner_type and owner_id must be given together; omit both for a global rule"
                 .to_owned(),
@@ -293,6 +305,10 @@ async fn create_billing_rule(
         request.enabled,
     )
     .await?;
+    match scope {
+        Some(owner) => state.billing_cache.invalidate_owner(&owner),
+        None => state.billing_cache.invalidate_all(),
+    }
     Ok(Json(billing_rule_item(rule)?))
 }
 
@@ -314,6 +330,8 @@ async fn delete_billing_rule(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     if rules::delete_rule(&state.pool, id).await? {
+        // Deletion returns no scope; conservatively invalidate every layer.
+        state.billing_cache.invalidate_all();
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!("billing rule {id} not found")))
@@ -343,7 +361,9 @@ async fn set_plan(
     Json(request): Json<SetPlanRequest>,
 ) -> Result<StatusCode, AppError> {
     let plan = parse_plan(&request.plan)?;
-    assignments::set_plan(&state.pool, &Owner::new(owner_type, owner_id), plan).await?;
+    let owner = Owner::new(owner_type, owner_id);
+    assignments::set_plan(&state.pool, &owner, plan).await?;
+    state.billing_cache.invalidate_owner(&owner);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -395,6 +415,7 @@ async fn delete_plan(
 ) -> Result<StatusCode, AppError> {
     let owner = Owner::new(owner_type, owner_id);
     if assignments::delete_plan(&state.pool, &owner).await? {
+        state.billing_cache.invalidate_owner(&owner);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
@@ -450,11 +471,17 @@ pub fn admin_router() -> Router<AppState> {
         )
         .route("/billing/rules/{id}", delete(delete_billing_rule))
         .route(
+            // Axum path parameters require non-empty segments, so these plan
+            // routes cannot receive an empty owner component.
             "/owners/{owner_type}/{owner_id}/plan",
             put(set_plan).get(get_plan).delete(delete_plan),
         )
         .route("/owners/{owner_type}/{owner_id}/usage", get(get_usage))
 }
+
+#[cfg(test)]
+#[path = "billing_cache_tests.rs"]
+mod billing_cache_tests;
 
 #[cfg(test)]
 mod tests {
@@ -603,8 +630,14 @@ mod tests {
             pool: pool.clone(),
             s3: Storage::build(&config).await.unwrap(),
             jwks_cache: JwksCache::new(Vec::new()),
+            billing_cache: std::sync::Arc::new(crate::billing::cache::BillingCache::new(
+                config.billing_cache_ttl_secs,
+            )),
             config,
             rate_limiters: std::sync::Arc::new(RateLimiters::default()),
+            public_rate_limiter: std::sync::Arc::new(
+                crate::auth::rate_limit::PublicRateLimiter::new(300),
+            ),
         };
         let router = axum::Router::new()
             .nest("/v1/admin", admin_router())
