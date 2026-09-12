@@ -450,7 +450,7 @@ async fn persist_uploaded_file(
     .bind(upload.size_bytes)
     .fetch_one(&mut *tx)
     .await
-    .map_err(|err| AppError::Internal(format!("insert file: {err}")))?;
+    .map_err(|err| map_insert_file_error(err, upload.folder_id))?;
     sqlx::query(
         "INSERT INTO file_objects \
          (file_id, object_kind, storage_key, size_bytes, mime_type) VALUES ($1, $2, $3, $4, $5)",
@@ -477,6 +477,17 @@ async fn persist_uploaded_file(
         .await
         .map_err(|err| AppError::Internal(format!("commit upload: {err}")))?;
     Ok(response)
+}
+
+fn map_insert_file_error(error: sqlx::Error, folder_id: Option<Uuid>) -> AppError {
+    match (&error, folder_id) {
+        (sqlx::Error::Database(database_error), Some(folder_id))
+            if database_error.code().as_deref() == Some("23503") =>
+        {
+            AppError::NotFound(format!("folder {folder_id}"))
+        }
+        _ => AppError::Internal(format!("insert file: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -570,6 +581,44 @@ mod tests {
             error.into_response().status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose postgres stack"]
+    async fn pg_upload_into_vanished_folder_is_not_found() {
+        // Given: the folder ID does not exist in PostgreSQL.
+        let config = Config::default();
+        let pool = test_pool().await;
+        let storage = Storage::build(&config).await.unwrap();
+        let state = test_state(config, pool, storage).await;
+        let folder_id = Uuid::now_v7();
+        let ctx = AccountContext {
+            owner: Owner::new("test-drive-files", Uuid::now_v7().to_string()),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 1024,
+                rate_limit_rpm: 100,
+            },
+        };
+
+        // When
+        let error = persist_uploaded_file(
+            &state,
+            &ctx,
+            UploadedFile {
+                id: Uuid::now_v7(),
+                folder_id: Some(folder_id),
+                name: "vanished-folder.txt".into(),
+                mime: "text/plain".into(),
+                key: "test-drive-files/vanished-folder.txt".into(),
+                size_bytes: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        // Then
+        assert!(matches!(error, AppError::NotFound(_)));
     }
 
     #[test]
