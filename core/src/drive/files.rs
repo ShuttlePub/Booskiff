@@ -140,8 +140,8 @@ async fn upload_file(
 ) -> Result<(StatusCode, Json<FileResponse>), AppError> {
     let name = query
         .name
-        .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| AppError::Validation("file name is required".into()))?;
+    super::validate_name(&name, "file")?;
     let mime = query
         .mime
         .filter(|mime| !mime.trim().is_empty())

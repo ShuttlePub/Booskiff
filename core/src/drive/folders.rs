@@ -174,13 +174,7 @@ fn folder_response(row: FolderRow) -> Result<FolderResponse, AppError> {
 }
 
 fn validate_folder_name(name: &str) -> Result<(), AppError> {
-    if name.trim().is_empty() {
-        return Err(AppError::Validation("folder name must not be blank".into()));
-    }
-    if name.chars().count() > 255 {
-        return Err(AppError::Validation("folder name is too long".into()));
-    }
-    Ok(())
+    super::validate_name(name, "folder")
 }
 
 fn map_database_error(error: sqlx::Error) -> AppError {
