@@ -293,6 +293,12 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    #[test]
+    fn public_rate_limit_defaults_to_300_when_config_is_default() {
+        // Given no overrides; when constructing defaults; then pin the documented quota.
+        assert_eq!(Config::default().public_rate_limit_rpm, 300);
+    }
+
     #[rstest]
     #[case(
         "https://id.example.com",

@@ -61,6 +61,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_limiter_allows_300_then_denies_when_default_budget_is_exhausted() {
+        // Given the documented 300 rpm budget for one IP.
+        let limiter = PublicRateLimiter::new(300);
+        let ip = std::net::Ipv4Addr::LOCALHOST.into();
+        // When 301 requests arrive in a single burst.
+        let admitted: [bool; 301] = std::array::from_fn(|_| limiter.check(ip));
+        // Then the first 300 succeed and the 301st is denied.
+        assert!(admitted[..300].iter().all(|allowed| *allowed));
+        assert!(!admitted[300]);
+    }
+
+    #[test]
     fn public_limiter_allows_burst_then_denies_when_budget_exhausted() {
         // Given a two-request budget for one IP.
         let limiter = PublicRateLimiter::new(2);
