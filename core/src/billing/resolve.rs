@@ -57,8 +57,7 @@ pub async fn effective_limits_cached(
             rules
         }
     };
-    let key = owner.key();
-    let entry = match cache.get_owner(&key) {
+    let entry = match cache.get_owner(owner) {
         Some(entry) => entry,
         None => {
             let assignment = match config.premium_mode {
@@ -67,7 +66,7 @@ pub async fn effective_limits_cached(
             };
             let rules = load_rules(pool, OWNER_RULES_SQL, Some(owner)).await?;
             let entry = crate::billing::cache::OwnerEntry { assignment, rules };
-            cache.store_owner_if_current(&key, entry.clone(), &generation);
+            cache.store_owner_if_current(owner, entry.clone(), &generation);
             entry
         }
     };
@@ -443,7 +442,7 @@ mod tests {
             stale.storage_quota_bytes,
             config.plan_default_storage_quota_bytes
         );
-        cache.invalidate_owner(&owner.key());
+        cache.invalidate_owner(&owner);
         let fresh = effective_limits_cached(&cache, &pool, &config, &owner)
             .await
             .unwrap();
