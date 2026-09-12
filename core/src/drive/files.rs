@@ -386,6 +386,12 @@ fn parse_content_length(headers: &HeaderMap) -> Result<i64, AppError> {
     Ok(declared)
 }
 
+/// Checks folder ownership only; it does not create folders.
+///
+/// The originally reviewed concurrent-folder-creation race therefore does not
+/// exist in this code. The live race is folder deletion after this check but
+/// before the file INSERT; the resulting FK violation is mapped to `NotFound`
+/// by `map_insert_file_error` and covered by both vanished-folder tests below.
 async fn ensure_owned_folder(
     pool: &sqlx::PgPool,
     owner: &Owner,
@@ -619,6 +625,72 @@ mod tests {
 
         // Then
         assert!(matches!(error, AppError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose postgres stack"]
+    async fn pg_concurrent_folder_delete_and_upload_never_500() {
+        // Given: an owner and a real folder in PostgreSQL.
+        let config = Config::default();
+        let pool = test_pool().await;
+        let storage = Storage::build(&config).await.unwrap();
+        let owner = Owner::new("test-drive-files-race", Uuid::now_v7().to_string());
+        let ctx = AccountContext {
+            owner: owner.clone(),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 1024,
+                rate_limit_rpm: 100,
+            },
+        };
+        let state = test_state(config, pool.clone(), storage).await;
+
+        for round in 0..8 {
+            let folder_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO folders (owner_type, owner_id, name) VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(&owner.owner_type)
+            .bind(&owner.owner_id)
+            .bind(format!("race-{round}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            // When: file INSERT and folder DELETE run concurrently.
+            let (upload_result, delete_result) = tokio::join!(
+                persist_uploaded_file(
+                    &state,
+                    &ctx,
+                    UploadedFile {
+                        id: Uuid::now_v7(),
+                        folder_id: Some(folder_id),
+                        name: format!("race-{round}.txt"),
+                        mime: "text/plain".into(),
+                        key: format!("test-drive-files/race-{round}.txt"),
+                        size_bytes: 1,
+                    },
+                ),
+                sqlx::query("DELETE FROM folders WHERE id = $1")
+                    .bind(folder_id)
+                    .execute(&pool),
+            );
+
+            delete_result.unwrap();
+
+            // Then: deletion may win (404) or insertion may win (success), but
+            // the FK race must never escape as an internal error (500).
+            match upload_result {
+                Ok(_) | Err(AppError::NotFound(_)) => {}
+                Err(error) => panic!("concurrent upload returned unexpected error: {error:?}"),
+            }
+
+            sqlx::query("DELETE FROM files WHERE owner_type = $1 AND owner_id = $2")
+                .bind(&owner.owner_type)
+                .bind(&owner.owner_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 
     #[test]
