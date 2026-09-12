@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aws_smithy_types::body::SdkBody;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AccountContext;
 use crate::billing::usage::{add_used_bytes, subtract_used_bytes, used_bytes};
-use crate::config::Config;
 use crate::error::AppError;
 use crate::model::{OBJECT_KIND_ORIGINAL, Owner};
 use crate::state::AppState;
@@ -29,7 +28,6 @@ use super::upload_body::CountingBody;
 
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
-const BODY_LIMIT_SLACK: i64 = 1024 * 1024;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct FileResponse {
@@ -108,15 +106,10 @@ impl FileRow {
     }
 }
 
-pub fn upload_router(config: &Config) -> Router<AppState> {
-    let body_limit_i64 = config
-        .plan_premium_max_file_bytes
-        .saturating_add(BODY_LIMIT_SLACK);
-    let body_limit = usize::try_from(body_limit_i64).unwrap_or(usize::MAX);
-    Router::new().route(
-        "/v1/files",
-        post(upload_file).route_layer(DefaultBodyLimit::max(body_limit)),
-    )
+/// CountingBody in upload_file is the sole body-size enforcement path.
+/// DefaultBodyLimit would be a no-op because upload_file extracts Body directly.
+pub fn upload_router() -> Router<AppState> {
+    Router::new().route("/v1/files", post(upload_file))
 }
 
 pub fn files_router() -> Router<AppState> {
@@ -489,6 +482,95 @@ async fn persist_uploaded_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn upload_returns_413_when_declared_length_exceeds_limit() {
+        // Given: a closed pool makes any database access fail.
+        let config = Config::default();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        pool.close().await;
+        let storage = Storage::build(&config).await.unwrap();
+        let state = test_state(config, pool, storage).await;
+        let ctx = AccountContext {
+            owner: Owner::new("test-files", Uuid::now_v7().to_string()),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 4,
+                rate_limit_rpm: 100,
+            },
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "5".parse().unwrap());
+
+        // When
+        let error = upload_file(
+            ctx,
+            State(state),
+            Query(UploadQuery {
+                name: Some("large.txt".into()),
+                mime: None,
+                folder_id: None,
+            }),
+            headers,
+            Body::empty(),
+        )
+        .await
+        .unwrap_err();
+
+        // Then
+        assert!(matches!(error, AppError::PayloadTooLarge(_)));
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires compose postgres and MinIO"]
+    async fn upload_returns_413_when_actual_body_exceeds_limit() {
+        // Given: the declared length fits exactly, but the body exceeds the cap.
+        let config = Config::default();
+        let pool = test_pool().await;
+        let storage = Storage::build(&config).await.unwrap();
+        storage.ensure_bucket().await.unwrap();
+        let state = test_state(config, pool, storage).await;
+        let ctx = AccountContext {
+            owner: Owner::new("test-files", Uuid::now_v7().to_string()),
+            limits: crate::model::Limits {
+                storage_quota_bytes: 1024,
+                max_file_bytes: 4,
+                rate_limit_rpm: 100,
+            },
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "4".parse().unwrap());
+
+        // When
+        let error = upload_file(
+            ctx,
+            State(state),
+            Query(UploadQuery {
+                name: Some("large.txt".into()),
+                mime: None,
+                folder_id: None,
+            }),
+            headers,
+            Body::from("12345"),
+        )
+        .await
+        .unwrap_err();
+
+        // Then
+        assert!(matches!(error, AppError::PayloadTooLarge(_)));
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
 
     #[test]
     fn foreign_file_row_maps_to_not_found() {

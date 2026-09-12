@@ -93,7 +93,7 @@ async fn run() {
     }
 
     let jwks_cache = JwksCache::new(config.jwt_trusted_issuers.clone());
-    let upload_routes = drive::files::upload_router(&config);
+    let upload_routes = drive::files::upload_router();
     let files_routes = drive::files::files_router();
     let state = AppState {
         pool,
