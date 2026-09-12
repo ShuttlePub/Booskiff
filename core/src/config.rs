@@ -53,6 +53,7 @@ pub struct Config {
     pub jwt_owner_type_claim: String,
     pub listen_addr: String,
     pub premium_mode: PremiumMode,
+    pub billing_cache_ttl_secs: u64,
     pub payment_provider: PaymentProviderCfg,
     pub plan_default_storage_quota_bytes: i64,
     pub plan_default_max_file_bytes: i64,
@@ -82,6 +83,7 @@ impl Default for Config {
             jwt_owner_type_claim: "owner_type".into(),
             listen_addr: "0.0.0.0:3000".into(),
             premium_mode: PremiumMode::Everyone,
+            billing_cache_ttl_secs: 60,
             payment_provider: PaymentProviderCfg::Disabled,
             plan_default_storage_quota_bytes: 1024 * 1024 * 1024,
             plan_default_max_file_bytes: 100 * 1024 * 1024,
@@ -127,6 +129,11 @@ impl Config {
                 "BOOSKIFF_JWT_OWNER_TYPE_CLAIM",
             ),
             listen_addr: override_str(d.listen_addr, "BOOSKIFF_LISTEN_ADDR"),
+            billing_cache_ttl_secs: override_parse(
+                d.billing_cache_ttl_secs,
+                "BOOSKIFF_BILLING_CACHE_TTL_SECS",
+                "billing_cache_ttl_secs",
+            )?,
             premium_mode: parse_premium_mode(
                 "BOOSKIFF_PREMIUM_MODE",
                 std::env::var("BOOSKIFF_PREMIUM_MODE")

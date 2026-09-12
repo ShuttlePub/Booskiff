@@ -720,6 +720,9 @@ mod tests {
 
     async fn test_state(config: Config, pool: sqlx::PgPool, s3: Storage) -> AppState {
         AppState {
+            billing_cache: std::sync::Arc::new(crate::billing::cache::BillingCache::new(
+                config.billing_cache_ttl_secs,
+            )),
             jwks_cache: crate::auth::jwks::JwksCache::new(config.jwt_trusted_issuers.clone()),
             pool,
             s3,

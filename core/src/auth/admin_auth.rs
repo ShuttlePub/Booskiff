@@ -140,6 +140,9 @@ mod tests {
                 .expect("lazy pool never connects"),
             s3: Storage::build(&config).await.unwrap(),
             jwks_cache: JwksCache::new(Vec::new()),
+            billing_cache: Arc::new(crate::billing::cache::BillingCache::new(
+                config.billing_cache_ttl_secs,
+            )),
             config,
             rate_limiters: Arc::new(RateLimiters::default()),
         }
@@ -204,6 +207,9 @@ mod tests {
             s3: Storage::build(&config).await.unwrap(),
             pool,
             jwks_cache: JwksCache::new(Vec::new()),
+            billing_cache: Arc::new(crate::billing::cache::BillingCache::new(
+                config.billing_cache_ttl_secs,
+            )),
             config,
             rate_limiters: Arc::new(RateLimiters::default()),
         };

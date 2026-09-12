@@ -42,6 +42,43 @@ pub async fn effective_limits(
     ))
 }
 
+pub async fn effective_limits_cached(
+    cache: &crate::billing::cache::BillingCache,
+    pool: &sqlx::PgPool,
+    config: &Config,
+    owner: &Owner,
+) -> Result<Limits, AppError> {
+    let generation = cache.generation();
+    let global = match cache.get_global() {
+        Some(rules) => rules,
+        None => {
+            let rules = load_rules(pool, GLOBAL_RULES_SQL, None).await?;
+            cache.store_global_if_current(rules.clone(), &generation);
+            rules
+        }
+    };
+    let key = owner.key();
+    let entry = match cache.get_owner(&key) {
+        Some(entry) => entry,
+        None => {
+            let assignment = match config.premium_mode {
+                PremiumMode::Everyone => None,
+                PremiumMode::Mirror => crate::billing::assignments::get_plan(pool, owner).await?,
+            };
+            let rules = load_rules(pool, OWNER_RULES_SQL, Some(owner)).await?;
+            let entry = crate::billing::cache::OwnerEntry { assignment, rules };
+            cache.store_owner_if_current(&key, entry.clone(), &generation);
+            entry
+        }
+    };
+    Ok(resolve_from_parts(
+        config,
+        entry.assignment,
+        global,
+        entry.rules,
+    ))
+}
+
 /// Pure layer composition mirroring [`effective_limits`] without the DB so
 /// the resolution-order contract is unit-testable: plan base limits →
 /// global rules → owner rules (later layers win per key).
@@ -358,6 +395,91 @@ mod tests {
         assert_eq!(limits.rate_limit_rpm, mirror.plan_default_rate_limit_rpm);
 
         cleanup(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_cached_limits_stale_until_invalidated() {
+        use crate::billing::cache::BillingCache;
+        let pool = test_pool().await;
+        let _guard = global_rules_guard(&pool).await;
+        let owner = Owner::new("test-billing-cache", uuid::Uuid::now_v7().to_string());
+        let other = Owner::new("test-billing-cache", uuid::Uuid::now_v7().to_string());
+        cleanup(&pool, &owner).await;
+        let config = mirror_config();
+        let cache = BillingCache::new(60);
+        for target in [&owner, &other] {
+            sqlx::query("INSERT INTO billing_rules (owner_type, owner_id, key, value) VALUES ($1, $2, 'max_file_bytes', '71')")
+                .bind(&target.owner_type).bind(&target.owner_id).execute(&pool).await.unwrap();
+            assert_eq!(
+                effective_limits_cached(&cache, &pool, &config, target)
+                    .await
+                    .unwrap()
+                    .max_file_bytes,
+                71
+            );
+            sqlx::query(
+                "UPDATE billing_rules SET value = '82' WHERE owner_type = $1 AND owner_id = $2",
+            )
+            .bind(&target.owner_type)
+            .bind(&target.owner_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            crate::billing::assignments::set_plan(&pool, target, Plan::Premium)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO billing_rules (key, value) VALUES ('storage_quota_bytes', '93')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale = effective_limits_cached(&cache, &pool, &config, &owner)
+            .await
+            .unwrap();
+        assert_eq!(stale.max_file_bytes, 71);
+        assert_eq!(stale.rate_limit_rpm, config.plan_default_rate_limit_rpm);
+        assert_eq!(
+            stale.storage_quota_bytes,
+            config.plan_default_storage_quota_bytes
+        );
+        cache.invalidate_owner(&owner.key());
+        let fresh = effective_limits_cached(&cache, &pool, &config, &owner)
+            .await
+            .unwrap();
+        assert_eq!(fresh.max_file_bytes, 82);
+        assert_eq!(fresh.rate_limit_rpm, config.plan_premium_rate_limit_rpm);
+        assert_eq!(
+            fresh.storage_quota_bytes,
+            config.plan_premium_storage_quota_bytes
+        );
+        assert_eq!(
+            effective_limits_cached(&cache, &pool, &config, &other)
+                .await
+                .unwrap()
+                .max_file_bytes,
+            71
+        );
+        cache.invalidate_all();
+        let fresh = effective_limits_cached(&cache, &pool, &config, &other)
+            .await
+            .unwrap();
+        assert_eq!(fresh.max_file_bytes, 82);
+        assert_eq!(fresh.storage_quota_bytes, 93);
+        // A closed pool proves a fully warm hit issues no SQL at all.
+        let closed = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(&config.database_url)
+            .unwrap();
+        closed.close().await;
+        assert_eq!(
+            effective_limits_cached(&cache, &closed, &config, &other)
+                .await
+                .unwrap()
+                .max_file_bytes,
+            82
+        );
+        cleanup(&pool, &owner).await;
+        cleanup(&pool, &other).await;
     }
 
     async fn test_pool() -> sqlx::PgPool {

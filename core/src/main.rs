@@ -98,6 +98,9 @@ async fn run() {
     let state = AppState {
         pool,
         s3: storage,
+        billing_cache: Arc::new(core::billing::cache::BillingCache::new(
+            config.billing_cache_ttl_secs,
+        )),
         config,
         jwks_cache,
         rate_limiters: Arc::new(RateLimiters::default()),

@@ -75,6 +75,7 @@ pub struct AppState {
     pub config: Config,
     pub jwks_cache: JwksCache,
     pub rate_limiters: Arc<RateLimiters>,
+    pub billing_cache: Arc<crate::billing::cache::BillingCache>,
 }
 
 #[cfg(test)]
