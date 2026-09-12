@@ -101,6 +101,9 @@ async fn run() {
         billing_cache: Arc::new(core::billing::cache::BillingCache::new(
             config.billing_cache_ttl_secs,
         )),
+        public_rate_limiter: Arc::new(core::auth::rate_limit::PublicRateLimiter::new(
+            config.public_rate_limit_rpm,
+        )),
         config,
         jwks_cache,
         rate_limiters: Arc::new(RateLimiters::default()),
@@ -141,7 +144,12 @@ async fn run() {
             std::process::exit(1);
         });
     tracing::info!("listening on http://{listen_addr}");
-    if let Err(err) = axum::serve(listener, app).await {
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         eprintln!("server error: {err}");
         std::process::exit(1);
     }

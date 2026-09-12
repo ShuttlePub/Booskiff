@@ -33,6 +33,7 @@ async fn pg_admin_billing_writes_invalidate_cache() {
         pool: pool.clone(),
         config,
         rate_limiters: Arc::new(crate::state::RateLimiters::default()),
+        public_rate_limiter: Arc::new(crate::auth::rate_limit::PublicRateLimiter::new(300)),
         billing_cache: Arc::clone(&cache),
     };
     let router = admin_router().with_state(state);

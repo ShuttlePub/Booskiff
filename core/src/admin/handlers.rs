@@ -621,6 +621,9 @@ mod tests {
             )),
             config,
             rate_limiters: std::sync::Arc::new(RateLimiters::default()),
+            public_rate_limiter: std::sync::Arc::new(
+                crate::auth::rate_limit::PublicRateLimiter::new(300),
+            ),
         };
         let router = axum::Router::new()
             .nest("/v1/admin", admin_router())

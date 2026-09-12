@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::auth::jwks::JwksCache;
-use crate::auth::rate_limit::OwnerRateLimiter;
+use crate::auth::rate_limit::{OwnerRateLimiter, PublicRateLimiter};
 use crate::config::Config;
 use crate::storage::Storage;
 
@@ -75,6 +75,7 @@ pub struct AppState {
     pub config: Config,
     pub jwks_cache: JwksCache,
     pub rate_limiters: Arc<RateLimiters>,
+    pub public_rate_limiter: Arc<PublicRateLimiter>,
     pub billing_cache: Arc<crate::billing::cache::BillingCache>,
 }
 

@@ -728,6 +728,9 @@ mod tests {
             s3,
             config,
             rate_limiters: std::sync::Arc::new(crate::state::RateLimiters::default()),
+            public_rate_limiter: std::sync::Arc::new(
+                crate::auth::rate_limit::PublicRateLimiter::new(300),
+            ),
         }
     }
 

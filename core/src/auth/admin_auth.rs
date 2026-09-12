@@ -145,6 +145,7 @@ mod tests {
             )),
             config,
             rate_limiters: Arc::new(RateLimiters::default()),
+            public_rate_limiter: Arc::new(crate::auth::rate_limit::PublicRateLimiter::new(300)),
         }
     }
 
@@ -212,6 +213,7 @@ mod tests {
             )),
             config,
             rate_limiters: Arc::new(RateLimiters::default()),
+            public_rate_limiter: Arc::new(crate::auth::rate_limit::PublicRateLimiter::new(300)),
         };
         let router = admin_router(state.clone());
 
