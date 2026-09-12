@@ -60,9 +60,10 @@ async fn pg_admin_billing_writes_invalidate_cache() {
         ("DELETE", String::new(), serde_json::Value::Null, true),
     ] {
         cache.store_global(vec![]);
-        for key in [owner.key(), "other".into()] {
+        let other = Owner::new("other", "owner");
+        for cached_owner in [&owner, &other] {
             cache.store_owner(
-                &key,
+                cached_owner,
                 OwnerEntry {
                     assignment: None,
                     rules: vec![],
@@ -88,10 +89,10 @@ async fn pg_admin_billing_writes_invalidate_cache() {
             response.status()
         );
         assert!(
-            cache.get_owner(&owner.key()).is_none(),
+            cache.get_owner(&owner).is_none(),
             "{method} must invalidate owner"
         );
-        assert_eq!(cache.get_owner("other").is_none(), all);
+        assert_eq!(cache.get_owner(&other).is_none(), all);
         assert_eq!(cache.get_global().is_none(), all);
         if method == "POST" {
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -99,6 +100,60 @@ async fn pg_admin_billing_writes_invalidate_cache() {
             rule_id = item["id"].as_str().unwrap().to_owned();
         }
     }
+
+    sqlx::query(
+        "INSERT INTO billing_rules (owner_type, owner_id, key, value, enabled) \
+         VALUES (NULL, NULL, $1, $2, true) \
+         ON CONFLICT ((COALESCE(owner_type, '')), (COALESCE(owner_id, '')), key) \
+         DO UPDATE SET value = EXCLUDED.value, enabled = EXCLUDED.enabled",
+    )
+    .bind("max_file_bytes")
+    .bind(serde_json::json!(72))
+    .execute(&pool)
+    .await
+    .unwrap();
+    cache.store_global(vec![("max_file_bytes".to_owned(), serde_json::json!(72))]);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/billing/rules")
+        .header("x-admin-token", &token)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "owner_type": "",
+                "owner_id": owner.owner_id,
+                "key": "max_file_bytes",
+                "value": 999,
+                "enabled": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "validation");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("owner_type must not be blank")
+    );
+
+    let global_value: serde_json::Value = sqlx::query_scalar(
+        "SELECT value FROM billing_rules WHERE owner_type IS NULL AND owner_id IS NULL AND key = $1",
+    )
+    .bind("max_file_bytes")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(global_value, serde_json::json!(72));
+    assert_eq!(
+        cache.get_global(),
+        Some(vec![("max_file_bytes".to_owned(), serde_json::json!(72))])
+    );
+
     sqlx::query("DELETE FROM admin_tokens WHERE name = $1")
         .bind(&token)
         .execute(&pool)
