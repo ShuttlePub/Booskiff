@@ -7,13 +7,16 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::error::AppError;
 use crate::model::OBJECT_KIND_ORIGINAL;
 use crate::state::AppState;
 
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
+#[cfg(test)]
+mod proxy_tests;
 
 #[derive(Debug, sqlx::FromRow)]
 struct PublicFile {
@@ -30,6 +33,23 @@ pub fn public_router() -> Router<AppState> {
     Router::new().route("/public/{key}", get(get_public_file))
 }
 
+fn resolve_client_ip(
+    trust_proxy_headers: bool,
+    forwarded_for: Option<&HeaderValue>,
+    peer: Option<IpAddr>,
+) -> Option<IpAddr> {
+    // This opt-in gate is the trust boundary: enable only behind a trusted proxy
+    // that sanitizes X-Forwarded-For, never on a directly exposed listener.
+    if trust_proxy_headers {
+        forwarded_for
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').find_map(|ip| ip.trim().parse().ok()))
+            .or(peer)
+    } else {
+        peer
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/public/{key}",
@@ -44,12 +64,17 @@ async fn get_public_file(
     State(state): State<AppState>,
     Path(key): Path<String>,
     connect_info: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let admitted = match connect_info {
-        Ok(ConnectInfo(addr)) => state.public_rate_limiter.check(addr.ip()),
-        // Deliberately bypass limiting for oneshot tests or non-TCP listeners
-        // without ConnectInfo. The production TCP server always injects it.
-        Err(_) => true,
+    let peer = connect_info.ok().map(|ConnectInfo(addr)| addr.ip());
+    let admitted = match resolve_client_ip(
+        state.config.trust_proxy_headers,
+        headers.get("x-forwarded-for"),
+        peer,
+    ) {
+        Some(ip) => state.public_rate_limiter.check(ip),
+        // Preserve fail-open when neither trusted headers nor ConnectInfo yield an IP.
+        None => true,
     };
     if !admitted {
         return Err(AppError::RateLimited);

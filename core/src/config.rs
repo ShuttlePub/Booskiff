@@ -64,6 +64,7 @@ pub struct Config {
     pub presigned_get_ttl_secs: u64,
     pub public_base_url: String,
     pub public_rate_limit_rpm: u32,
+    pub trust_proxy_headers: bool,
     /// Raw admin token seeded into `admin_tokens` (name `bootstrap`) on
     /// startup when no active token with that hash exists yet.
     pub admin_bootstrap_token: Option<String>,
@@ -95,6 +96,7 @@ impl Default for Config {
             presigned_get_ttl_secs: 900,
             public_base_url: "http://localhost:3000".into(),
             public_rate_limit_rpm: 300,
+            trust_proxy_headers: false,
             admin_bootstrap_token: None,
         }
     }
@@ -193,6 +195,11 @@ impl Config {
                 d.admin_bootstrap_token,
                 "BOOSKIFF_ADMIN_BOOTSTRAP_TOKEN",
             ),
+            trust_proxy_headers: override_parse(
+                d.trust_proxy_headers,
+                "BOOSKIFF_TRUST_PROXY_HEADERS",
+                "trust_proxy_headers",
+            )?,
         })
     }
 }
