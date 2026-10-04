@@ -783,7 +783,7 @@ async fn scenario_s5(client: &Client, server: &CoreServer) {
     )
     .await;
 
-    let after_delete = expect_status(
+    expect_error_code(
         client
             .get(format!(
                 "{}/v1/files?folder_id={}",
@@ -793,16 +793,32 @@ async fn scenario_s5(client: &Client, server: &CoreServer) {
             .send()
             .await
             .expect("S5 list files after folder delete"),
-        StatusCode::OK,
+        StatusCode::NOT_FOUND,
+        "not_found",
         "S5 list files after folder delete",
+    )
+    .await;
+
+    let root_files = expect_status(
+        client
+            .get(format!("{}/v1/files?root=true", server.base_url))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .expect("S5 list root files after folder delete"),
+        StatusCode::OK,
+        "S5 list root files after folder delete",
     )
     .await
     .json::<FileListResponse>()
     .await
-    .expect("S5 parse folder file list after delete");
+    .expect("S5 parse root file list after delete");
     assert!(
-        !after_delete.items.iter().any(|item| item.id == file.id),
-        "S5 deleted folder must not list its former files"
+        root_files
+            .items
+            .iter()
+            .any(|item| item.id == file.id && item.folder_id.is_none()),
+        "S5 deleted folder's former file must appear in the root listing"
     );
 
     let unlinked = expect_status(
