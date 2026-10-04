@@ -57,11 +57,19 @@ pub struct UploadQuery {
     folder_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+    /// List immediate children of this folder.
     folder_id: Option<Uuid>,
+    /// List only root files. Omitted filters preserve legacy all-files listing.
+    root: Option<bool>,
+    /// RFC 3339 created_at of the previous page's last file. Requires before_id.
+    before_created_at: Option<String>,
+    /// ID of the previous page's last file. Requires before_created_at; incompatible with nonzero offset.
+    before_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromRow)]
@@ -208,12 +216,18 @@ async fn upload_file(
     response.map(|file| (StatusCode::CREATED, Json(file)))
 }
 
-#[utoipa::path(get, path = "/v1/files", tag = "files", security(("bearer_auth" = [])), responses((status = 200, body = FileListResponse)))]
+#[utoipa::path(get, path = "/v1/files", tag = "files", security(("bearer_auth" = [])), params(ListQuery), responses((status = 200, body = FileListResponse), (status = 400), (status = 404)))]
 async fn list_files(
     ctx: AccountContext,
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<FileListResponse>, AppError> {
+    let root = query.root.unwrap_or(false);
+    if root && query.folder_id.is_some() {
+        return Err(AppError::Validation(
+            "root and folder_id cannot be combined".into(),
+        ));
+    }
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     let offset = query.offset.unwrap_or(0);
     if !(1..=MAX_LIST_LIMIT).contains(&limit) {
@@ -224,17 +238,43 @@ async fn list_files(
     if offset < 0 {
         return Err(AppError::Validation("offset must be non-negative".into()));
     }
+    let cursor = match (query.before_created_at.as_deref(), query.before_id) {
+        (None, None) => None,
+        (Some(created_at), Some(id)) => {
+            if offset != 0 {
+                return Err(AppError::Validation(
+                    "cursor and nonzero offset cannot be combined".into(),
+                ));
+            }
+            let created_at = time::OffsetDateTime::parse(created_at, &Rfc3339)
+                .map_err(|_| AppError::Validation("before_created_at must be RFC 3339".into()))?;
+            Some((created_at, id))
+        }
+        _ => {
+            return Err(AppError::Validation(
+                "before_created_at and before_id must be supplied together".into(),
+            ));
+        }
+    };
+    if let Some(folder_id) = query.folder_id {
+        ensure_owned_folder(&state.pool, &ctx.owner, folder_id).await?;
+    }
     let rows = sqlx::query_as::<_, FileRow>(
         "SELECT id, owner_type, owner_id, name, mime_type, size_bytes, folder_id, is_public, created_at \
          FROM files WHERE owner_type = $1 AND owner_id = $2 \
            AND ($3::uuid IS NULL OR folder_id = $3) \
-         ORDER BY created_at DESC LIMIT $4 OFFSET $5",
+           AND (NOT $6 OR folder_id IS NULL) \
+           AND ($7::timestamptz IS NULL OR (created_at, id) < ($7, $8::uuid)) \
+         ORDER BY created_at DESC, id DESC LIMIT $4 OFFSET $5",
     )
     .bind(&ctx.owner.owner_type)
     .bind(&ctx.owner.owner_id)
     .bind(query.folder_id)
     .bind(limit)
     .bind(offset)
+    .bind(root)
+    .bind(cursor.map(|(created_at, _)| created_at))
+    .bind(cursor.map(|(_, id)| id))
     .fetch_all(&state.pool)
     .await
     .map_err(|err| AppError::Internal(format!("list files: {err}")))?;
@@ -302,7 +342,7 @@ async fn download_url(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<UrlResponse>, AppError> {
-    load_owned_file(&state.pool, &ctx.owner, id).await?;
+    let file = load_owned_file(&state.pool, &ctx.owner, id).await?;
     let key: Option<String> = sqlx::query_scalar(
         "SELECT storage_key FROM file_objects WHERE file_id = $1 AND object_kind = $2",
     )
@@ -313,7 +353,7 @@ async fn download_url(
     .map_err(|err| AppError::Internal(format!("load original object: {err}")))?;
     let key = key.ok_or_else(|| AppError::NotFound(format!("file object {id}")))?;
     let ttl = Duration::from_secs(state.config.presigned_get_ttl_secs);
-    let url = state.s3.presign_get(&key, ttl).await?;
+    let url = state.s3.presign_download(&key, ttl, &file.name).await?;
     Ok(Json(UrlResponse { url }))
 }
 
@@ -818,3 +858,7 @@ mod tests {
         pool
     }
 }
+
+#[cfg(test)]
+#[path = "file_listing_tests.rs"]
+mod listing_tests;

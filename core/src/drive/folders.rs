@@ -1,6 +1,6 @@
 //! Folder CRUD handlers.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -14,16 +14,35 @@ use crate::error::AppError;
 use crate::model::Owner;
 use crate::state::AppState;
 
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct FolderResponse {
     pub id: Uuid,
     pub name: String,
     pub created_at: String,
+    pub parent_id: Option<Uuid>,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateFolderRequest {
     pub name: String,
+    /// Omitted or null creates a root folder.
+    pub parent_id: Option<Uuid>,
+}
+
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListFoldersQuery {
+    /// Only root folders. Cannot be combined with parent_id.
+    pub root: Option<bool>,
+    /// Only immediate children of this folder; omitted filters preserve legacy all-folders listing.
+    pub parent_id: Option<Uuid>,
+}
+
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DeleteFolderQuery {
+    /// Reject deletion if the folder contains files. Child folders always prevent deletion.
+    pub require_empty: Option<bool>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -41,6 +60,7 @@ struct FolderRow {
     id: Uuid,
     name: String,
     created_at: OffsetDateTime,
+    parent_id: Option<Uuid>,
 }
 
 /// Builds the authenticated folder CRUD router.
@@ -53,37 +73,60 @@ pub fn folders_router() -> Router<AppState> {
         )
 }
 
-#[utoipa::path(post, path = "/v1/folders", tag = "folders", security(("bearer_auth" = [])))]
+#[utoipa::path(post, path = "/v1/folders", tag = "folders", security(("bearer_auth" = [])), request_body = CreateFolderRequest, responses((status = 201, body = FolderResponse), (status = 400), (status = 404), (status = 409)))]
 async fn create_folder(
     context: AccountContext,
     State(state): State<AppState>,
     Json(request): Json<CreateFolderRequest>,
 ) -> Result<(StatusCode, Json<FolderResponse>), AppError> {
     validate_folder_name(&request.name)?;
+    let mut tx = state.pool.begin().await.map_err(internal_database_error)?;
+    if let Some(parent_id) = request.parent_id {
+        // Share the parent key lock with the FK check through commit. A concurrent
+        // deletion either waits for this child, or wins and returns a clean 404.
+        lock_owned_folder(&mut tx, &context.owner, parent_id, false).await?;
+    }
     let row = sqlx::query_as::<_, FolderRow>(
-        "INSERT INTO folders (owner_type, owner_id, name) VALUES ($1, $2, $3) \
-         RETURNING id, name, created_at",
+        "INSERT INTO folders (owner_type, owner_id, name, parent_id) VALUES ($1, $2, $3, $4) \
+         RETURNING id, name, created_at, parent_id",
     )
     .bind(&context.owner.owner_type)
     .bind(&context.owner.owner_id)
     .bind(&request.name)
-    .fetch_one(&state.pool)
+    .bind(request.parent_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_database_error)?;
+    tx.commit().await.map_err(internal_database_error)?;
     Ok((StatusCode::CREATED, Json(folder_response(row)?)))
 }
 
-#[utoipa::path(get, path = "/v1/folders", tag = "folders", security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/v1/folders", tag = "folders", security(("bearer_auth" = [])), params(ListFoldersQuery), responses((status = 200, body = FolderListResponse), (status = 400), (status = 404)))]
 async fn list_folders(
     context: AccountContext,
     State(state): State<AppState>,
+    Query(query): Query<ListFoldersQuery>,
 ) -> Result<Json<FolderListResponse>, AppError> {
+    let root = query.root.unwrap_or(false);
+    if root && query.parent_id.is_some() {
+        return Err(AppError::Validation(
+            "root and parent_id cannot be combined".into(),
+        ));
+    }
+    if let Some(parent_id) = query.parent_id {
+        find_folder(&state.pool, &context.owner, parent_id).await?;
+    }
     let rows = sqlx::query_as::<_, FolderRow>(
-        "SELECT id, name, created_at FROM folders \
-         WHERE owner_type = $1 AND owner_id = $2 ORDER BY created_at ASC",
+        "SELECT id, name, created_at, parent_id FROM folders \
+         WHERE owner_type = $1 AND owner_id = $2 \
+           AND (NOT $3 OR parent_id IS NULL) \
+           AND ($4::uuid IS NULL OR parent_id = $4) \
+         ORDER BY created_at ASC, id ASC",
     )
     .bind(&context.owner.owner_type)
     .bind(&context.owner.owner_id)
+    .bind(root)
+    .bind(query.parent_id)
     .fetch_all(&state.pool)
     .await
     .map_err(internal_database_error)?;
@@ -94,7 +137,7 @@ async fn list_folders(
     Ok(Json(FolderListResponse { items }))
 }
 
-#[utoipa::path(get, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)), responses((status = 200, body = FolderResponse), (status = 404)))]
 async fn get_folder(
     context: AccountContext,
     State(state): State<AppState>,
@@ -104,7 +147,7 @@ async fn get_folder(
     Ok(Json(folder_response(row)?))
 }
 
-#[utoipa::path(patch, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])))]
+#[utoipa::path(patch, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)), request_body = RenameFolderRequest, responses((status = 200, body = FolderResponse), (status = 400), (status = 404), (status = 409)))]
 async fn rename_folder(
     context: AccountContext,
     State(state): State<AppState>,
@@ -114,7 +157,7 @@ async fn rename_folder(
     validate_folder_name(&request.name)?;
     let row = sqlx::query_as::<_, FolderRow>(
         "UPDATE folders SET name = $1 WHERE id = $2 AND owner_type = $3 AND owner_id = $4 \
-         RETURNING id, name, created_at",
+         RETURNING id, name, created_at, parent_id",
     )
     .bind(&request.name)
     .bind(id)
@@ -127,29 +170,64 @@ async fn rename_folder(
     Ok(Json(folder_response(row)?))
 }
 
-#[utoipa::path(delete, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])))]
+#[utoipa::path(delete, path = "/v1/folders/{id}", tag = "folders", security(("bearer_auth" = [])), params(("id" = Uuid, Path), DeleteFolderQuery), responses((status = 204), (status = 404), (status = 409)))]
 async fn delete_folder(
     context: AccountContext,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<DeleteFolderQuery>,
 ) -> Result<StatusCode, AppError> {
-    let result =
-        sqlx::query("DELETE FROM folders WHERE id = $1 AND owner_type = $2 AND owner_id = $3")
-            .bind(id)
-            .bind(&context.owner.owner_type)
-            .bind(&context.owner.owner_id)
-            .execute(&state.pool)
-            .await
-            .map_err(internal_database_error)?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("folder not found".into()));
+    let mut tx = state.pool.begin().await.map_err(internal_database_error)?;
+    // FOR UPDATE conflicts with the FK key-share lock taken by both child
+    // creation and file insertion. Checking emptiness after acquiring it makes
+    // require_empty atomic, including concurrent uploads.
+    lock_owned_folder(&mut tx, &context.owner, id, true).await?;
+    let nonempty: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM folders WHERE parent_id = $1) \
+         OR ($2 AND EXISTS(SELECT 1 FROM files WHERE folder_id = $1))",
+    )
+    .bind(id)
+    .bind(query.require_empty.unwrap_or(false))
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal_database_error)?;
+    if nonempty {
+        return Err(AppError::Conflict("folder is not empty".into()));
     }
+    sqlx::query("DELETE FROM folders WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+    tx.commit().await.map_err(internal_database_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn lock_owned_folder(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner: &Owner,
+    id: Uuid,
+    exclusive: bool,
+) -> Result<(), AppError> {
+    let query = if exclusive {
+        "SELECT id FROM folders WHERE id = $1 AND owner_type = $2 AND owner_id = $3 FOR UPDATE"
+    } else {
+        "SELECT id FROM folders WHERE id = $1 AND owner_type = $2 AND owner_id = $3 FOR KEY SHARE"
+    };
+    sqlx::query_scalar::<_, Uuid>(query)
+        .bind(id)
+        .bind(&owner.owner_type)
+        .bind(&owner.owner_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal_database_error)?
+        .ok_or_else(|| AppError::NotFound("folder not found".into()))?;
+    Ok(())
 }
 
 async fn find_folder(pool: &sqlx::PgPool, owner: &Owner, id: Uuid) -> Result<FolderRow, AppError> {
     sqlx::query_as::<_, FolderRow>(
-        "SELECT id, name, created_at FROM folders \
+        "SELECT id, name, created_at, parent_id FROM folders \
          WHERE id = $1 AND owner_type = $2 AND owner_id = $3",
     )
     .bind(id)
@@ -170,6 +248,7 @@ fn folder_response(row: FolderRow) -> Result<FolderResponse, AppError> {
         id: row.id,
         name: row.name,
         created_at,
+        parent_id: row.parent_id,
     })
 }
 
@@ -183,6 +262,11 @@ fn map_database_error(error: sqlx::Error) -> AppError {
             if database_error.code().as_deref() == Some("23505") =>
         {
             AppError::Conflict("folder name already exists".into())
+        }
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("23503") =>
+        {
+            AppError::Conflict("folder is not empty".into())
         }
         _ => internal_database_error(error),
     }
@@ -279,3 +363,7 @@ mod tests {
             .expect("cleanup file");
     }
 }
+
+#[cfg(test)]
+#[path = "folder_hierarchy_tests.rs"]
+mod hierarchy_tests;

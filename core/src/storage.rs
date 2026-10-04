@@ -154,11 +154,33 @@ impl Storage {
     /// external clients get reachable URLs while the client keeps
     /// talking to the internal endpoint.
     pub async fn presign_get(&self, key: &str, ttl: Duration) -> Result<String, AppError> {
+        self.presign_get_with_disposition(key, ttl, None).await
+    }
+
+    /// Sign an attachment response override so browser downloads retain the
+    /// original UTF-8 filename even across a cross-origin redirect.
+    pub async fn presign_download(
+        &self,
+        key: &str,
+        ttl: Duration,
+        name: &str,
+    ) -> Result<String, AppError> {
+        self.presign_get_with_disposition(key, ttl, Some(attachment_disposition(name)))
+            .await
+    }
+
+    async fn presign_get_with_disposition(
+        &self,
+        key: &str,
+        ttl: Duration,
+        disposition: Option<String>,
+    ) -> Result<String, AppError> {
         let presigned = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            .set_response_content_disposition(disposition)
             .presigned(
                 PresigningConfig::builder()
                     .expires_in(ttl)
@@ -342,6 +364,33 @@ fn rewrite_endpoint(url: &str, from: &str, to: &str) -> String {
     }
 }
 
+/// RFC 6266 / 8187: ASCII fallback plus percent-encoded UTF-8 filename*.
+/// Never place user-controlled quotes, path separators or controls in the
+/// quoted fallback; the extended parameter contains only safe ASCII bytes.
+fn attachment_disposition(name: &str) -> String {
+    let fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let encoded: String = name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +492,80 @@ mod tests {
             Err(other) => panic!("expected NotFound, got: {other}"),
             Ok(_) => panic!("expected NotFound, object still present"),
         }
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[test]
+    fn attachment_filename_is_utf8_and_cannot_inject_headers() {
+        let disposition = attachment_disposition("資料 \"A\"\r\n/\\.txt");
+        assert_eq!(
+            disposition,
+            "attachment; filename=\"__ _A_____.txt\"; filename*=UTF-8''%E8%B3%87%E6%96%99%20%22A%22%0D%0A%2F%5C.txt"
+        );
+        assert!(axum::http::HeaderValue::from_str(&disposition).is_ok());
+    }
+
+    #[tokio::test]
+    async fn download_url_signs_the_attachment_response_override() {
+        let storage = Storage::build(&Config::default()).await.unwrap();
+        let url = storage
+            .presign_download("test/name", Duration::from_secs(60), "資料.txt")
+            .await
+            .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        assert_eq!(
+            params.get("response-content-disposition").unwrap().as_ref(),
+            attachment_disposition("資料.txt")
+        );
+        assert!(params.contains_key("X-Amz-Signature"));
+        let regular = storage
+            .presign_get("test/name", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!regular.contains("response-content-disposition"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MinIO (BOOSKIFF_TEST_S3_ENDPOINT or 127.0.0.1:9000)"]
+    async fn minio_attachment_download_returns_original_utf8_name() {
+        let config = Config {
+            s3_endpoint: std::env::var("BOOSKIFF_TEST_S3_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
+            ..Config::default()
+        };
+        let storage = Storage::build(&config).await.unwrap();
+        storage.ensure_bucket().await.unwrap();
+        let key = format!("test/attachment/{}", uuid::Uuid::now_v7());
+        storage
+            .put_streaming(
+                &key,
+                ByteStream::from_static(b"attachment").into_inner(),
+                10,
+                "text/plain",
+            )
+            .await
+            .unwrap();
+        let url = storage
+            .presign_download(&key, Duration::from_secs(60), "資料.txt")
+            .await
+            .unwrap();
+        let response = reqwest::get(url).await.unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("content-disposition")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            attachment_disposition("資料.txt")
+        );
+        assert_eq!(response.text().await.unwrap(), "attachment");
+        storage.delete_object(&key).await.unwrap();
     }
 }
