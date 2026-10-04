@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_LOG="${ROOT_DIR}/e2e/core-server.log"
+COMPOSE_FILE="${ROOT_DIR}/e2e/compose.yml"
 HEALTH_TIMEOUT_SECONDS=90
 
 cleanup() {
@@ -16,7 +17,7 @@ cleanup() {
     fi
   fi
   if [[ "${BOOSKIFF_E2E_TEARDOWN:-0}" == "1" ]]; then
-    docker compose -f "${ROOT_DIR}/compose.yml" down -v
+    docker compose -f "${COMPOSE_FILE}" down -v
   fi
   exit "${status}"
 }
@@ -25,24 +26,22 @@ trap cleanup EXIT
 cd "${ROOT_DIR}"
 : >"${SERVER_LOG}"
 
-docker compose up -d
+docker compose -f "${COMPOSE_FILE}" up -d --build
 
 deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
 while true; do
-  postgres_id="$(docker compose ps -q postgres)"
-  minio_id="$(docker compose ps -q minio)"
-  mc_init_id="$(docker compose ps -aq mc-init)"
+  postgres_id="$(docker compose -f "${COMPOSE_FILE}" ps -q postgres)"
+  minio_id="$(docker compose -f "${COMPOSE_FILE}" ps -q minio)"
 
   postgres_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${postgres_id}" 2>/dev/null || true)"
   minio_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${minio_id}" 2>/dev/null || true)"
-  mc_init_state="$(docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}' "${mc_init_id}" 2>/dev/null || true)"
 
-  if [[ "${postgres_health}" == "healthy" && "${minio_health}" == "healthy" && "${mc_init_state}" == "exited:0" ]]; then
+  if [[ "${postgres_health}" == "healthy" && "${minio_health}" == "healthy" ]]; then
     break
   fi
   if (( SECONDS >= deadline )); then
-    echo "Timed out waiting for compose services: postgres=${postgres_health}, minio=${minio_health}, mc-init=${mc_init_state}" >&2
-    docker compose logs --tail=200 >&2
+    echo "Timed out waiting for compose services: postgres=${postgres_health}, minio=${minio_health}" >&2
+    docker compose -f "${COMPOSE_FILE}" logs --tail=200 >&2
     exit 1
   fi
   sleep 1
