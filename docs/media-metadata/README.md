@@ -9,7 +9,7 @@
 - 画像 file ごとに、利用許諾（版参照と固定状態）・通常タグ・共通センシティブ分類 ID を、Account 所有のメタデータとして Booskiff が保管する（d02-q07）。
 - 所有者向け API（許諾・タグ・分類の更新、補完候補）と、ShuttlePub 向けの内部 API（初回共有の固定、メタデータ取得、変更通知）を定義する。
 - 範囲外: DB migration・稼働 route・OpenAPI 生成物・既存画像データの移行の実行・ShuttlePub 側の投稿処理と連合配送・UI・公開後の許諾変更と履歴・管理者による分類訂正・共有（D9）・組織 Drive の権限。
-- 決定済みの利用者向け方針（grill 記録 d02-q01〜q11・d10・d11）と、本設計で置く**技術判断（T1〜T11）**、**他 unit との合意事項**を、確定済みの利用者向け方針と混ぜずに区別して書く（§7〜§9）。
+- 決定済みの利用者向け方針（grill 記録 d02-q01〜q11・d10・d11）と、本設計で置く**技術判断（T1〜T11）**、**他 unit との合意事項**を、確定済みの利用者向け方針と混ぜずに区別して書く（§7〜§9）。未決の製品判断は §9 の「他 Account による同一 file の再利用」。
 
 ## 2. メタデータモデル
 
@@ -27,8 +27,8 @@
 ### 2.2 行がない file の扱い（既存画像）
 
 `file_media_metadata` に行が無い file は、**未指定（`unspecified` v1）・未固定・revision 0・タグなし・分類なし**とみなす。API はこの既定値を返す。
-Booskiff の導入 migration は**テーブル追加のみ**で、既存 file に行を作らず、既存データを書き換えない（d02-q08）。初回の変更で行が作られ revision 1 になる。
-no-op の PATCH は行を作らない。状態例 E1〜E6 と backfill 手順は [state-machine.md §5・§6](state-machine.md#5-既存画像の状態例e1e6)。
+Booskiff の導入 migration は**テーブル追加のみ**で、既存 file に行を作らず、既存データを書き換えない（d02-q08）。行が作られるのは、最初の内容変更（PATCH）・`commit`・backfill のときで、revision は 0→1 になる。
+`reserve`・`release`・no-op の PATCH は行を作らない（予約ロックは別テーブルで持ち、`reserved` は導出する。api.md §2.2）。状態例 E1〜E6 と backfill 手順は [state-machine.md §5・§6](state-machine.md#5-既存画像の状態例e1e6)。
 
 ### 2.3 revision
 
@@ -48,10 +48,12 @@ no-op の PATCH は行を作らない。状態例 E1〜E6 と backfill 手順は
 
 ### 3.1 流れ
 
-1. ShuttlePub が投稿を検証し、他者向けに確定する直前に `reserve`（file を `reserved` にロック。予約中は許諾変更不可）。
-2. 投稿を ShuttlePub に永続化（`reservation_id` を同一トランザクションで保存）。
-3. 成功なら `commit`（`fixed`）。拒否・失敗なら `release`（`unfixed` に戻る）。
+1. ShuttlePub が投稿を検証し、他者向けに確定する直前に `reserve`（file に予約ロックを取る。予約中は許諾変更不可）。
+2. 投稿を ShuttlePub に**未公開（他者に表示・連合配送しない）**で永続化（`reservation_id` を同一トランザクションで保存）。
+3. 成功なら `commit`（`fixed`）。`commit` が成功してから投稿を公開する。拒否・失敗なら `release`（ロックを解く）。
 4. 連合配送（Emumet 経由）の失敗は固定を解かない。
+
+**ShuttlePub への契約: 投稿は `commit` 成功まで他者に見せない。** 閲覧者が見る許諾は常に固定済みの値だけになり、TTL 失効などで再予約になっても公開済みの条件は変わらない。
 
 詳細は [state-machine.md §2〜§4](state-machine.md)。
 
@@ -61,10 +63,10 @@ no-op の PATCH は行を作らない。状態例 E1〜E6 と backfill 手順は
 | --- | --- | --- | --- | --- |
 | 1 相（確定のみ） | 永続化の**前**に `commit` | API が 1 つ | 永続化に失敗しても file が固定される（不可逆。未共有なのに許諾を選び直せない）。応答喪失で固定したか不明 | 不採用 |
 | 1 相（永続化の後に確定のみ） | 永続化後に `commit` だけ | API が 1 つ。過剰固定がない | 永続化〜確定の間に所有者が許諾を変えると、閲覧者が見た条件と固定値がずれる。同時投稿の競合を防げない | 不採用 |
-| **2 相（予約→確定／解放）** | `reserve` でロック→永続化→`commit`/`release` | 閲覧者が見た条件で固定される。拒否は解放で戻せる。応答喪失は冪等キーで再送。同時変更は行ロックで直列化 | API が 3 つ。TTL・失効の仕様が要る | **採用（推奨）** |
+| **2 相（予約→確定／解放）** | `reserve` でロック→**未公開で**永続化→`commit` 成功後に公開（失敗は `release`） | 閲覧者が見た条件で固定される（公開は固定後のみ）。拒否は解放で戻せる。応答喪失は冪等キーで再送。同時変更は行ロックで直列化 | API が 3 つ。TTL・失効の仕様が要る。ShuttlePub に「`commit` 成功まで他者に見せない」契約を要求する | **採用（推奨）** |
 | Booskiff の publish で固定 | `/public/{key}` 発行で固定 | 実装が単純 | 公開 URL 発行は他者向け共有と無関係。d02-q06 に反する | 不採用 |
 
-TTL の失効は遅延失効（誰もロックを必要としない間は遅い `commit` も成功）。理由は [state-machine.md §4.4](state-machine.md#44-失効lapseと遅い-commit)。
+TTL の失効は遅延失効（誰もロックを必要としない間は遅い `commit` も成功）。失効後の `commit` は失敗するが、投稿は `commit` 成功まで他者に見えないので、公開済みの条件は変わらない（再予約で最新の許諾を取り込んで公開する）。詳細は [state-machine.md §4.4](state-machine.md#44-失効lapseと遅い-commit)。
 
 ## 4. 責務分担
 
@@ -105,7 +107,7 @@ TTL の失効は遅延失効（誰もロックを必要としない間は遅い 
 
 | # | 論点 | 選択肢 | 推奨 | 理由 |
 | --- | --- | --- | --- | --- |
-| T1 | ShuttlePub→Booskiff の認証 | (a) サービス JWT（信頼 issuer・`scope: media-metadata:service`・owner claim なし）(b) 共有の静的 admin token (c) mTLS | **(a)** | 既存の JWT/JWKS 検証を再利用でき、短命・失効が容易。owner claim が無いので所有者向け route を流用できず、逆に Account JWT では内部 API を呼べない。(b) は漏洩時の影響が大きい |
+| T1 | ShuttlePub→Booskiff の認証 | (a) サービス JWT（サービス用の別 issuer 集合・別 `aud`・`token_use=service`・`scope: media-metadata:service`）(b) 共有の静的 admin token (c) mTLS | **(a)** | 既存の JWT/JWKS 検証を再利用でき、短命・失効が容易。ただし現行実装は owner claim が無い token を `account/<sub>` として扱い scope を見ないため、「owner claim が無い」だけでは所有者向け route から排除できない。issuer/aud の分離と、`AccountContext` 側でのサービス token 拒否・内部 route 側の scope 検査を**明示的に**入れる（api.md §4 冒頭）。(b) は漏洩時の影響が大きい |
 | T2 | センシティブ分類語彙の正本 | (a) Booskiff (b) ShuttlePub | **(a) Booskiff**。**ShuttlePub の D10 契約と要合意** | file に付く ID を保存する側が語彙の整合（未知 ID の拒否・退役）を保てる。ShuttlePub は ID を解決して表示・連合へ写像。D10 の閲覧設定・外部指定の写像は ShuttlePub 側 |
 | T3 | タグ補完候補 | (a) 自分のタグのみ (b) 自分優先＋サーバー全体、**3 人以上の異なる所有者**が使う共有済みタグに限る (c) 全タグ | **(b)** | d11-q02（自分優先→サーバー全体）を満たしつつ、未共有 file や個人的なタグの漏洩を防ぐ。k=3 は目安で、運用で見直す |
 | T4 | メタデータの保存形 | (a) 別テーブル `file_media_metadata`（行なし＝既定）(b) `files` に列追加 | **(a)** | 既存行を書き換えず、既存画像の移行が不要。`FileResponse`・`openapi.json` を変えない。行ロックは `files` 行で取る |
@@ -132,7 +134,7 @@ TTL の失効は遅延失効（誰もロックを必要としない間は遅い 
 ## 9. D11 反映範囲は案 B で確定
 
 **確定済み（ユーザー本人の回答「D11: bで確定しよう」）**: 画像のタグ・センシティブ分類を直したとき、その file を使う**同じ Account の全 Profile の投稿**に反映する（案 B）。
-本文・本文分類・同一 bytes の別 file・他人の投稿は変更しない（d11-q01）。他 Account による同一 file の再利用は契約上起きない（`reserve` は所有者のみ。Booskiff は他人の file を 404 にする）。
+本文・本文分類・同一 bytes の別 file・他人の投稿は変更しない（d11-q01）。**この確定は「同じ Account の全 Profile への反映範囲」だけ**で、他 Account による同一 file の再利用は未決（次の「未決」を参照）。
 
 ### 本設計への反映
 
@@ -140,6 +142,20 @@ TTL の失効は遅延失効（誰もロックを必要としない間は遅い 
 - ShuttlePub は `file_id` を使う同じ Account の全添付を対象に、添付ごとの `applied_revision` で反映済みかを管理する。Profile ごとの絞り込み・対象外投稿の参照版固定は不要。
 - 失敗分の再試行は、対象となる全添付のうち失敗したものだけ（d11-q04）。
 - テストベクトルは [test-vectors.md §11（G）](test-vectors.md#11-d11-反映範囲g)。
+
+### 未決（ユーザー判断待ち）: 他 Account による同一 file の再利用
+
+案 B の確定は他 Account の再利用を決めていない（host packet の未決項目「他人・別 Profile の再利用」のうち、別 Profile は案 B で解決済み。**他人（他 Account）は未決**）。
+現設計の「予約・変更は所有者のみ」は、決定済みの方針ではなく**暫定の技術制限**である（d02-q09 は「許諾を設定できるのは所有者のみ」であって、他人が添付できるかは決めていない）。
+
+| 案 | 内容 | 主な論点 |
+| --- | --- | --- |
+| R1（暫定・現設計） | 他 Account は他人の file を添付できない。`reserve` は所有者のみ、他人の file は 404 | ShuttlePub が他人の file の添付を拒否する。他 Account は再アップロードで別 file を作る（同一 bytes でも別 file。d02-q10） |
+| R2 | 所有者が許可した他 Account が添付できる | 権限付与の仕組み（D9 共有・組織 Drive）、`reserve` の呼び出し主体と認可、他人の投稿での共有が所有者の許諾を固定してよいか、案 B の反映範囲（同じ Account）を他 Account の投稿に広げるか、`batch-get`・フィードの対象投稿の特定、所有者の file 削除時の扱い |
+| R3 | 他 Account が file を複製して自分の file にする | 許諾・タグ・分類の継承可否（継承しない場合は未指定から）、複製元との関係、同一 bytes の別 file として扱う（d02-q10 と整合） |
+
+推奨（未確定）: **初回は R1**。R2 は D9（共有）の決定後に別 unit で扱う。R1 は R2/R3 へ拡張しても既存の契約（所有者向け API・固定状態・予約）を壊さない（認可の条件を広げるだけ）。
+判断に依存する箇所: api.md §4.1・§6（`reserve` の所有者一致検査）、state-machine §2 の T06・R13、test-vectors の Z07・Z08・G05、責務分担表（認可の行）。
 
 ### 不採用の案 A との比較（記録）
 
@@ -152,7 +168,7 @@ TTL の失効は遅延失効（誰もロックを必要としない間は遅い 
 | 失敗分の再試行の対象 | 失敗した添付 | 失敗した対象内の添付のみ |
 | ShuttlePub 側で必要な情報 | Account → Profile の対応は不要 | 変更の起点の Profile と添付の Profile |
 
-状態遷移表（[state-machine.md](state-machine.md) §2・§3）は両案で同形だったため、案 B の確定による変更はない。
+状態遷移表（[state-machine.md](state-machine.md) §2・§3）は両案で同形だったため、案 B の確定による変更はない。他 Account 再利用（上記）は案 A/B とは独立の未決事項である。
 ADR が必要かは closeout で判断する（本 unit では起票しない）。
 
 ## 10. 後続実装 unit への分割案と依存順序

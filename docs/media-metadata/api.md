@@ -15,7 +15,7 @@
 | ベース | 所有者向けは `/v1/...`、ShuttlePub 向け内部は `/v1/internal/media-metadata/...`、管理者向けは `/v1/admin/media-metadata/...` |
 | 形式 | JSON（UTF-8）。時刻は RFC 3339。ID は UUID（file・reservation）または文字列 slug（license・category） |
 | 所有者向けの認証 | 既存の Account JWT（`AccountContext`）。所有者は JWT から決まる。他人の file は **404**（存在秘匿。不在と区別しない） |
-| 内部 API の認証 | ShuttlePub のサービス JWT（T1）。Account JWT では呼べず（403）、サービス JWT では所有者向け route を呼べない（401/403） |
+| 内部 API の認証 | ShuttlePub のサービス JWT（T1）。**明示的な検査**で、Account JWT では内部 route を呼べず（401）、サービス JWT では所有者向け route を呼べない（401）。検査の内容は §4 冒頭 |
 | 管理者の認証 | 既存の admin token（`AdminPrincipal`） |
 | キャッシュ | メタデータ系 route は **`Cache-Control: no-store`**。`/public/{key}` の immutable キャッシュを流用しない（README §6） |
 | レート制限 | 所有者向けは既存の owner 単位制限（`AccountContext`）。内部 API はサービス単位の別制限（後続 unit で値を決める） |
@@ -26,7 +26,7 @@
 | HTTP | `code`（既存） | `reason`（提案） | 主な発生条件 |
 | --- | --- | --- | --- |
 | 400 | `validation` | `invalid_tag` / `too_many_tags` / `unknown_license` / `license_not_selectable` / `unknown_sensitive_category` / `category_retired` / `invalid_request` / `batch_too_large` / `invalid_ttl` | 入力検証 |
-| 401 | `unauthorized` | — | token 不備・未信頼 issuer |
+| 401 | `unauthorized` | `service_token_not_accepted` / `account_token_not_accepted` | token 不備・未信頼 issuer／所有者向け route にサービス token／内部 route に Account token |
 | 403 | `forbidden` | `missing_scope` / `license_write_disabled` | 内部 API にサービス scope が無い／許諾の書込みが無効な運用段階（state-machine §6） |
 | 404 | `not_found` | — | file/reservation が無い、または所有者不一致（区別しない） |
 | 409 | `conflict` | `revision_mismatch` / `license_fixed` / `license_reserved` / `file_reserved` / `idempotency_key_reused` / `reservation_lapsed` / `reservation_released` / `reservation_committed` / `file_missing` / `cursor_expired` / `license_exists` | 競合・状態違反 |
@@ -76,11 +76,10 @@ CREATE TABLE file_media_metadata (
     revision BIGINT NOT NULL CHECK (revision >= 1),
     license_id TEXT NOT NULL DEFAULT 'unspecified',
     license_version INT NOT NULL DEFAULT 1,
-    license_state TEXT NOT NULL DEFAULT 'unfixed'
-        CHECK (license_state IN ('unfixed','reserved','fixed')),
-    reservation_id UUID NULL,                -- license_state = 'reserved' のときのみ
+    -- 'reserved' は保存しない（予約ロックから導出。下記）。fixed_at が非 NULL = fixed、NULL = fixed でない。
     fixed_at TIMESTAMPTZ NULL,
     fixed_via TEXT NULL CHECK (fixed_via IN ('share','backfill')),
+    CHECK ((fixed_at IS NULL) = (fixed_via IS NULL)),
     tags TEXT[] NOT NULL DEFAULT '{}',
     sensitive_categories TEXT[] NOT NULL DEFAULT '{}',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -124,11 +123,15 @@ CREATE TABLE media_license_reservation_items (
     reservation_id UUID NOT NULL REFERENCES media_license_reservations(id) ON DELETE CASCADE,
     file_id UUID NOT NULL,                 -- files への FK は張らない（file 削除後も予約の履歴を残す）
     already_fixed BOOLEAN NOT NULL,
+    lock_active BOOLEAN NOT NULL,          -- この項目が file の予約ロックを保持している間 TRUE（already_fixed は FALSE）
     PRIMARY KEY (reservation_id, file_id)
 );
+-- file あたり有効な予約ロックは 1 つ。メタデータ行が無い file（revision 0）にも取れる。
+CREATE UNIQUE INDEX media_license_lock_active_idx
+    ON media_license_reservation_items (file_id) WHERE lock_active;
 
 CREATE TABLE media_metadata_changes (      -- 変更フィードの outbox
-    seq BIGSERIAL PRIMARY KEY,
+    seq BIGSERIAL PRIMARY KEY,             -- 一意性・同一 txid 内の並び用。カーソルの主キーではない（§4.6）
     txid XID8 NOT NULL DEFAULT pg_current_xact_id(),
     file_id UUID NOT NULL,                 -- FK なし（deleted 通知のため）
     owner_type TEXT NOT NULL,
@@ -137,8 +140,11 @@ CREATE TABLE media_metadata_changes (      -- 変更フィードの outbox
     kinds TEXT[] NOT NULL,                 -- 'tags' | 'sensitive_categories' | 'deleted'
     changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX media_metadata_changes_cursor_idx ON media_metadata_changes (txid, seq);
 ```
 
+- **`reserved` の導出**: `license.state` は、行があって `fixed_at` が非 NULL なら `fixed`、そうでなく `lock_active` の予約項目があれば `reserved`、どちらでもなければ `unfixed`。
+  `reserve`・`release` はメタデータ行を作らず revision も変えないので、行なし（revision 0）の file も予約できる（`reserve`→`release` は行なしのまま。`reserve`→`commit` は行を作る）。
 - 所有者は `files.owner_type` / `files.owner_id` が正で、メタデータ行に重複して持たない。
 - `files` の既存列・既存 route の応答（`FileResponse`）は変えない。メタデータは `/v1/files/{id}/metadata` の別リソースにする。
   これにより `openapi.json` の既存スキーマは変わらず、画像 bytes・公開 URL・`/public/{key}` の挙動にも影響しない。
@@ -277,8 +283,16 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
 
 ## 4. ShuttlePub 向け内部 API
 
-認証: サービス JWT（T1）。`iss` は信頼 issuer、`aud` は Booskiff、`scope` claim に `media-metadata:service` を含む。**owner claim を持たない**ので
-`AccountContext` を通る所有者向け route は使えない。所有者向け Account JWT で内部 route を呼ぶと 403（`missing_scope`）。
+認証: ShuttlePub のサービス JWT（T1）。
+
+**現行実装の事実**: `verify_token`（`core/src/auth/jwt.rs`）は信頼 issuer・署名・`exp`・（設定時の）`aud` だけを検証し、`owner_from_claims`（同 69〜83 行）は owner claim が無いとき `owner_type = account`・`sub` = 所有者 ID とみなす。
+`AccountContext`（`core/src/auth/extractor.rs` 27〜43 行）は scope や token 種別を見ない。したがって「owner claim が無い」ことはサービス token を所有者向け route から**排除しない**。
+サービス token（例: `sub = "shuttlepub"`）を既存の `AccountContext` に通すと、`account/shuttlepub` という所有者として扱われうる。排除は後続実装で次の**明示的な検査**として入れる（契約）:
+
+1. **信頼設定を分ける**: サービス JWT 用に別の設定（例: `BOOSKIFF_SERVICE_JWT_TRUSTED_ISSUERS`・`BOOSKIFF_SERVICE_JWT_AUDIENCE`。名称は後続 unit で確定）を持つ。Account 用の issuer 集合・`aud` と**重複させない**（重複があれば起動時エラー）。
+2. **所有者向け route（`AccountContext`）**: 検証後に、(a) `iss` がサービス issuer 集合に含まれる、または (b) `token_use = "service"` もしくは `scope` にサービス scope を含む token は **401（`reason: service_token_not_accepted`）で拒否**する。`sub` がたまたま所有者 ID と一致しても所有者として扱わない。
+3. **内部 route（`ServiceContext`、新設）**: サービス issuer 集合・サービス `aud` で検証し、`token_use = "service"` と `scope` に `media-metadata:service` を要求する。`sub` から所有者を導かない。issuer がサービス集合に無い token（Account JWT を含む）は 401（`reason: account_token_not_accepted`）、サービス issuer だが scope が足りない token は 403（`missing_scope`）。
+4. 上記は、既存の Account route・admin route の挙動（および既存テスト）を変えない追加の検査とする。
 リクエスト本文の `owner`（`{owner_type, owner_id}`）は「その投稿の所有 Account」を ShuttlePub が主張する値で、Booskiff は file の実際の所有者と一致する場合のみ処理する（不一致は 404）。
 
 ### 4.1 `POST /v1/internal/media-metadata/reservations`（予約）
@@ -295,8 +309,8 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
 
 - `file_ids` は 1〜20 件（重複は 400）。`ttl_seconds` は省略時 3600、1〜86400 の範囲外は 400 `invalid_ttl`。
 - 全件の所有確認 → 全件を ID 昇順で `FOR UPDATE` → 判定 → 反映を**原子的**に行う。1 件でも所有者不一致・不在なら全体が 404（どの file かは区別しない）。
-- 判定: `unfixed` → `reserved` にして `reservation_id` を設定。`reserved` かつ別の未失効の予約 → 全体が 409 `file_reserved`。
-  `reserved` かつ予約が TTL 超過 → 旧予約を `lapsed` にして新予約で `reserved`。`fixed` → 変化なし（`already_fixed: true`）。
+- 判定: `unfixed`（行なしを含む）→ 予約項目を `lock_active` で作る（メタデータ行は作らない・revision 不変）。`reserved` かつ別の未失効の予約 → 全体が 409 `file_reserved`。
+  `reserved` かつ予約が TTL 超過 → **その file の項目だけ** `lock_active = FALSE` にして旧予約を `lapsed` にし、新予約で `reserved`（他 file のロックは取らない）。`fixed` → 変化なし（`already_fixed: true`）。
 - 新規は 201、同じ `(owner, idempotency_key)` で同一内容の再送は 200（現在の `status` と最新スナップショット）。内容が異なる再送は 409 `idempotency_key_reused`。
 
 ```json
@@ -312,15 +326,15 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
 
 ### 4.2 `POST /v1/internal/media-metadata/reservations/{reservation_id}/commit`（確定）
 
-本文 `{ "owner": {…} }`。予約内の全 file を原子的に `fixed`（`fixed_at`・`fixed_via = 'share'`、revision +1）にする。
+本文 `{ "owner": {…} }`。予約内の全 file を原子的に `fixed`（`fixed_at`・`fixed_via = 'share'`、revision +1）にする。行が無い file は、未指定（`unspecified` v1）の行を revision 1 で作る（0→1）。
 `already_fixed` の項目は変化なし。応答は `status: "committed"` と確定後の `items`（`metadata` の `license.state = "fixed"`）。
 状態ごとの応答は state-machine §3（R04〜R08）: 再送は 200（冪等）、`lapsed` は 409 `reservation_lapsed`、`released` は 409 `reservation_released`、
 予約内の file が削除済みなら 409 `file_missing`（何も確定しない）。所有者不一致・不在は 404。TTL 超過のみで `active` のままなら成功する（遅延失効）。
 
 ### 4.3 `POST /v1/internal/media-metadata/reservations/{reservation_id}/release`（解放）
 
-本文 `{ "owner": {…} }`。`active` の予約を `released` にし、対象 file を `unfixed` に戻す（revision 変化なし）。
-応答は `status: "released"`。`released`/`lapsed` への再送は 200（冪等）、`committed` は 409 `reservation_committed`。
+本文 `{ "owner": {…} }`。`active` の予約を `released` にし、対象 file のロックを解く（行は作らず、revision 変化なし）。削除済みの file は無視して残りを解く。
+応答は `status: "released"`。`released` への再送は 200（冪等）、`lapsed` への `release` は 200 で、失効していない項目（同じ予約の他 file）のロックを解く。`committed` は 409 `reservation_committed`。
 
 ### 4.4 `POST /v1/internal/media-metadata/batch-get`（一括取得）
 
@@ -363,7 +377,9 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
 ```
 
 - 配信は at-least-once。同一 file の複数の変更は 1 件にまとめてよい（`revision` は最新値）。順序は保証しない（`revision` の大きい方が新しい）。
-- コミット順の取りこぼしを避けるため、サーバーは `txid` が現在のスナップショットの xmin より小さい行だけを返す（outbox の標準的手法。T8）。
+- **カーソルと取りこぼし防止（T8）**: サーバーは `txid < pg_snapshot_xmin(pg_current_snapshot())` の行だけを、**`(txid, seq)` 昇順**で返す。`next_cursor`／`after` は最後に返した行の `txid:seq`（不透明な文字列）。
+  `seq` だけをカーソルにしてはならない: `seq` は INSERT 時に割り当たりコミット順と一致しないため（例: txid 100 の行が seq 11、txid 101 の行が seq 10。100 が先に終わり 101 が実行中だと、seq 11 を返してカーソルが 11 に進み、後で現れる seq 10 を永久に取りこぼす）。
+  xmin 未満の txid はすべて完了済みで、これから現れる行の txid は xmin 以上なので、`(txid, seq)` 順のカーソルより小さい位置に行が後から挿入されることはない。
 - 保持期間（既定 30 日）を過ぎた `after` は 409 `cursor_expired`。ShuttlePub は §4.4 で全添付を突合して回復する。
 - フィードに出るのは `fixed` の file の `tags` / `sensitive_categories` の変更と `deleted`（state-machine §7）。
 - 項目は file 単位。D11 は案 B（同じ Account の全 Profile に反映）で確定しているため、起点の Profile を示す項目は無い。ShuttlePub が `file_id` を使う同じ Account の全添付を対象にする。
@@ -375,7 +391,7 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
 ```
 
 - 1〜500 件。各 file を ID 昇順でロックし、`unfixed` を `fixed`（`fixed_via = 'backfill'`）にする。冪等。
-- 結果: `fixed` / `already_fixed` / `not_found`（不在・所有者不一致を区別しない）/ `skipped_reserved`（予約中。0 件のはず）。`dry_run: true` は DB を変えず結果の見込みだけ返す。
+- 結果: `fixed` / `already_fixed` / `not_found`（不在・所有者不一致を区別しない）/ `skipped_reserved`（予約ロック中。固定も予約の破壊もしない。ShuttlePub が後で再実行する。state-machine §6）。`dry_run: true` は DB を変えず結果の見込みだけ返す。
 - 行が無い file は `unspecified` v1・revision 1 の行を作る。行がある file は設定済みの許諾のまま固定する。フィードには出さない。
 - 手順と順序の制約は state-machine §6。
 
@@ -394,10 +410,10 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
 
 | 操作 | 所有者 JWT | サービス JWT | 管理者 token | 無認証 |
 | --- | --- | --- | --- | --- |
-| `GET/PATCH /v1/files/{id}/metadata` | 自分の file のみ（他人は 404） | 不可 | 不可 | 401 |
-| `GET /v1/media-metadata/{licenses,sensitive-categories,tag-suggestions}` | 可 | 不可 | 不可 | 401 |
-| `…/reservations`・`commit`・`release`・`backfill-fixed` | 403 | 本文の `owner` が file の所有者と一致する場合のみ（不一致は 404） | 不可 | 401 |
-| `…/batch-get`・`…/changes` | 403 | 可（`batch-get` は `fixed` の file のみ中身を返す） | 不可 | 401 |
+| `GET/PATCH /v1/files/{id}/metadata` | 自分の file のみ（他人は 404） | 不可（401 `service_token_not_accepted`） | 不可 | 401 |
+| `GET /v1/media-metadata/{licenses,sensitive-categories,tag-suggestions}` | 可 | 不可（401 `service_token_not_accepted`） | 不可 | 401 |
+| `…/reservations`・`commit`・`release`・`backfill-fixed` | 401（`account_token_not_accepted`） | 本文の `owner` が file の所有者と一致する場合のみ（不一致は 404）。scope 不足は 403 | 不可 | 401 |
+| `…/batch-get`・`…/changes` | 401（`account_token_not_accepted`） | 可（`batch-get` は `fixed` の file のみ中身を返す）。scope 不足は 403 | 不可 | 401 |
 | `/v1/admin/media-metadata/…` | 不可 | 不可 | 可 | 401 |
 | `/public/{key}` | メタデータを一切返さない・参照しない（既存挙動を変更しない） |||
 
