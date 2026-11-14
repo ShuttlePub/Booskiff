@@ -42,7 +42,7 @@ file ごとに次の 2 つの状態機械がある。
 | T03 | `unfixed` | `expected_revision` 不一致（O） | — | 変化なし | 変化なし | 409 `revision_mismatch` |
 | T04 | `unfixed` | `reserve`（SP） | 所有者一致・他の有効な予約なし | `reserved`（行なしでも可。**行は作らず** revision 0 のまま） | 変化なし | 201 |
 | T05 | `unfixed` | `reserve`（SP） | 別の `active`（未失効）予約が存在 | 変化なし | 変化なし | 409 `file_reserved` |
-| T06 | `unfixed` | `reserve`（SP） | 所有者不一致・file 不在（所有者限定は暫定の技術制限。README §9「他 Account 再利用」は未決） | 変化なし | 変化なし | 404（区別しない） |
+| T06 | `unfixed` | `reserve`（SP） | 所有者不一致・file 不在（所有者限定はユーザー決定 R1「他 Account 再利用は当面禁止」。README §9。D9 後に見直し） | 変化なし | 変化なし | 404（区別しない） |
 | T07 | `reserved` | 許諾変更（O） | 予約が未失効 | 変化なし | 変化なし | 409 `license_reserved` |
 | T08 | `reserved` | 許諾変更（O） | 予約が TTL 超過（遅延失効） | `unfixed`（許諾更新）。当該項目のロックが失効し予約は `lapsed`。同じ予約の他 file のロックは残る | +1 | 200 |
 | T09 | `reserved` | タグ・分類の更新（O） | `expected_revision` 一致 | `reserved`（タグ・分類更新） | +1 | 200 |
@@ -50,7 +50,7 @@ file ごとに次の 2 つの状態機械がある。
 | T11 | `reserved` | `release`（SP） | 予約が `active` | `unfixed`（行は作らない・変更しない） | 変化なし | 200 |
 | T12 | `reserved` | `reserve`（SP・別予約） | 既存予約が TTL 超過 | 旧予約の当該項目が失効し旧予約は `lapsed`、新予約で `reserved` | 変化なし | 201 |
 | T13 | `reserved` | file 削除（O） | 予約が未失効 | 変化なし | 変化なし | 409 `file_reserved` |
-| T14 | `reserved` | file 削除（O） | 予約が TTL 超過 | メタデータ行（あれば）ごと削除。当該項目は失効し予約は `lapsed` | — | 204 |
+| T14 | `reserved` | file 削除（O） | 予約が TTL 超過 | メタデータ行（あれば）ごと削除。当該項目は失効し予約は `lapsed`（以後の `commit` は 409 `reservation_lapsed`） | — | 204 |
 | T15 | `fixed` | 許諾を**別**の版参照へ変更（O） | — | 変化なし | 変化なし | 409 `license_fixed` |
 | T16 | `fixed` | 同じ許諾を再指定（O） | 値が同一 | `fixed` | 変化なし | 200（no-op） |
 | T17 | `fixed` | タグ・分類の更新（O） | `expected_revision` 一致 | `fixed`（更新） | +1 | 200、フィード通知あり |
@@ -72,7 +72,7 @@ file ごとに次の 2 つの状態機械がある。
 | R02 | `active`/`committed`/`released`/`lapsed` | `reserve`（同じ `idempotency_key`・同一内容） | 変化なし | 200。現在の `status` と最新のスナップショットを返す（応答喪失の再送） |
 | R03 | 任意 | `reserve`（同じ `idempotency_key`・**異なる**内容） | 変化なし | 409 `idempotency_key_reused` |
 | R04 | `active` | `commit` | `committed` | 200。対象 file が `fixed`（`already_fixed` 項目は変化なし） |
-| R05 | `committed` | `commit`（再送） | 変化なし | 200。確定結果を再返却（冪等） |
+| R05 | `committed` | `commit`（再送） | 変化なし | 200。確定結果を再返却（冪等）。**file 削除より再送を優先**: 確定後に file が削除されていても 200 `committed` を返し、削除済みの項目は `deleted: true`（メタデータなし）で示す。`file_missing` にしない |
 | R06 | `active`（TTL 超過・未失効） | `commit` | `committed` | 200。遅延失効なので成功（§4.4） |
 | R07 | `lapsed` | `commit` | 変化なし | 409 `reservation_lapsed`。**何も確定しない**。ShuttlePub は再予約（§4.4）。投稿は `commit` 成功まで他者に見せない契約なので、公開済みの条件は変わらない |
 | R08 | `released` | `commit` | 変化なし | 409 `reservation_released` |
@@ -82,7 +82,8 @@ file ごとに次の 2 つの状態機械がある。
 | R12 | `lapsed` | `release` | 残っている項目のロックを解く | 200（冪等）。失効していない項目（同じ予約の他 file）のロックもここで解放される |
 | R13 | 任意 | 所有者が一致しない `owner` で `commit`/`release`/`reserve` | 変化なし | 404（予約の存在を秘匿） |
 
-`commit` は予約内の**全 file**を原子的に確定する。一部の file が欠けている（削除済み）場合は、何も確定せず 409 `file_missing` とする。予約は `active` のまま残り、
+`commit` は予約内の**全 file**を原子的に確定する。一部の file が欠けている場合は、何も確定せず 409 `file_missing` とする。
+欠けるのは `already_fixed` の項目（予約時点で固定済みだった file）が `reserve` 後に削除された場合だけである（ロック中の項目の削除は、未失効なら 409 `file_reserved`、失効後なら項目が失効して `reservation_lapsed`。T13・T14）。予約は `active` のまま残り、
 残りの file のロックも残る。ShuttlePub は **まず旧予約を `release`**（欠けた file は無視して残りのロックを解く）してから、欠けた file を除外して新しい `idempotency_key` で再予約する。
 `release` せずに再予約すると、旧予約のロックが未失効の間は 409 `file_reserved` になる（投稿が削除済み file を参照している異常系）。
 
@@ -140,7 +141,8 @@ file ごとに次の 2 つの状態機械がある。
 ### 4.3 同時変更の直列化
 
 - すべての変更系操作（PATCH・reserve・commit・release・backfill・file 削除）は、対象 file の `files` 行を `SELECT ... FOR UPDATE` してから行う。メタデータ行が無くても `files` 行は存在するので、「行が無い」file の初回変更同士も直列化される。
-- 複数 file を扱う操作（reserve/commit/release/backfill）は file ID 昇順でロックを取り、デッドロックを避ける。
+- 複数 file を扱う操作（reserve/commit/release/backfill）は file ID 昇順で `files` 行のロックを取り、**そのあとに**予約行（`media_license_reservations`）をロックする（全操作で同じ順序）。`commit`/`release` は予約 ID から項目の file ID を先に読み（項目は不変）、`files` 行を昇順でロックしてから予約行をロックし、状態を再検証する。
+- それでもデッドロック・直列化失敗（SQLSTATE 40P01/40001）が起きた場合、サーバーはトランザクションを最大 3 回まで再試行し、それでも失敗したら 500（`internal`）を返す。すべての変更系操作は冪等キー・状態判定で再送可能なので、ShuttlePub は同じ要求を再送してよい。
 - 所有者の PATCH は加えて `expected_revision` による楽観排他を行う。ロック取得後に revision を比較するので、同時 PATCH のうち 1 つだけが成功し、他は 409 `revision_mismatch`。
 
 ### 4.4 失効（lapse）と遅い commit

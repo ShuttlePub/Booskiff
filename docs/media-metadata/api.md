@@ -328,7 +328,7 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
 
 本文 `{ "owner": {…} }`。予約内の全 file を原子的に `fixed`（`fixed_at`・`fixed_via = 'share'`、revision +1）にする。行が無い file は、未指定（`unspecified` v1）の行を revision 1 で作る（0→1）。
 `already_fixed` の項目は変化なし。応答は `status: "committed"` と確定後の `items`（`metadata` の `license.state = "fixed"`）。
-状態ごとの応答は state-machine §3（R04〜R08）: 再送は 200（冪等）、`lapsed` は 409 `reservation_lapsed`、`released` は 409 `reservation_released`、
+状態ごとの応答は state-machine §3（R04〜R08）: 再送は 200（冪等。**確定後に file が削除されていても再送は 200**で、削除済みの項目は `deleted: true`・`metadata` なしで返す）、`lapsed` は 409 `reservation_lapsed`、`released` は 409 `reservation_released`、
 予約内の file が削除済みなら 409 `file_missing`（何も確定しない）。所有者不一致・不在は 404。TTL 超過のみで `active` のままなら成功する（遅延失効）。
 
 ### 4.3 `POST /v1/internal/media-metadata/reservations/{reservation_id}/release`（解放）
@@ -371,7 +371,7 @@ merge-patch 風。省略したフィールドは変更しない。`tags`・`sens
     { "seq": "1042", "file_id": "6f1c0a52-…", "owner": { "owner_type": "account", "owner_id": "acc_123" },
       "revision": 4, "kinds": ["tags"], "changed_at": "…" }
   ],
-  "next_cursor": "1042",
+  "next_cursor": "81234:1042",
   "has_more": false
 }
 ```

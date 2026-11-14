@@ -126,7 +126,9 @@
 | S30 | FA1 は行なし | SP が `reserve` → `commit` | 201 → 200。`commit` が未指定 v1 の行を作り `fixed`・revision 1・`fixed_via: share`（0→1） |
 | S31 | FA1 は行なし・`reserve` 済み | Alice が `PATCH {expected_revision: 0, tags: ["x"]}` | 200・revision 1（行を作成。許諾は `reserved` のまま・ロック維持）。続く `commit` は 200・revision 2 |
 | S32 | FA1・FA2 を 1 つの予約で `reserve`、TTL 超過 | Alice が FA2 の許諾だけ変更（FA2 の項目が失効）→ SP が `commit` | `commit` は 409 (reservation_lapsed)・FA1 も `fixed` にならない。FA1 のロックは残る。SP が `release` → FA1 のロックが解ける（200）→ 再予約 |
-| S33 | FA1・FA2 を 1 つの予約で `reserve`。FA2 は TTL 超過後に削除 | SP が `commit` | 409 (file_missing)。何も確定しない（FA1 はロックのまま）。SP が旧予約を `release` せず再予約（FA1 のみ）すると 409 (file_reserved)。`release` してから再予約すると 201 |
+| S34 | S02 の続き（`commit` 済み）。その後 Alice が FA1 を削除 | SP が `commit` を再送 | 200 `committed`。削除済みの項目は `deleted: true`・`metadata` なし（`file_missing` にしない。再送を file 削除より優先） |
+| S35 | FA1・FA2 を逆順に含む 2 つの予約・PATCH・`DELETE` を並行実行（ロック順の検証） | `files` 行は ID 昇順 → 予約行の順でロック | デッドロックしない。万一 40P01/40001 が起きても内部で最大 3 回再試行され、再送で成功する |
+| S33 | FA1 は `unfixed`、FA2 は `fixed`。1 つの予約で `reserve [FA1, FA2]`（FA2 は `already_fixed: true`）。その後 Alice が FA2 を削除 | SP が `commit` | 409 (file_missing)。何も確定しない（FA1 はロックのまま）。SP が旧予約を `release` せず FA1 のみで再予約すると 409 (file_reserved)。`release`（FA2 は無視）してから再予約すると 201 |
 
 ## 6. 同時変更（X）
 
@@ -156,7 +158,7 @@
 | F07 | フィードの `after` が保持期間より古い | `GET changes?after=old` | 409 (cursor_expired)。SP は `batch-get` で全添付を突合して回復 |
 | F08 | フィードの同じ項目を 2 回受信 | `[ShuttlePub 側]` `revision <= applied_revision` の添付は無視 | 二重の Update 送信なし（冪等な consumer） |
 | F09 | レート制限超過 | SP が内部 API を連続呼び出し | 429。状態は変わらず、再試行（冪等キー同一）で正常に処理される |
-| F10 | 削除済み file を含む予約（TTL 超過後に削除） | `commit` | 409 (file_missing)。何も確定されない。SP は旧予約を `release` してから、欠けた file を除いて再予約 |
+| F10 | `already_fixed` の file を含む予約の後、その file が削除された | `commit` | 409 (file_missing)。何も確定されない。SP は旧予約を `release` してから、欠けた file を除いて再予約 |
 
 ## 8. 一括取得・変更フィード（B）
 
@@ -208,10 +210,10 @@
 | ID | 前提 | 操作 | 期待 |
 | --- | --- | --- | --- |
 | G01 | FA1 を Alice の Profile P1・P2 の投稿が使っている | Alice がタグを更新 | フィードは FA1 について 1 件。`[ShuttlePub 側]` `file_id` を使う同じ Account の全添付（P1・P2）が `applied_revision` 更新の対象 |
-| G02 | 同上 | フィード項目・`batch-get` の応答 | Profile や投稿を示す項目を含まない（file 単位）。`file_id`・`owner`・`revision`・`kinds` のみ |
+| G02 | 同上 | フィード項目・`batch-get` の応答 | Profile や投稿を示す項目を含まない（file 単位）。フィード項目は `seq`・`file_id`・`owner`・`revision`・`kinds`・`changed_at` のみ、`batch-get` は `owner`・`metadata`（`file_id`・`revision`・`license`・`tags`・`sensitive_categories`・`updated_at`）のみ |
 | G03 | 同上 | Alice が `change_context` を含む PATCH を送る | 400 (invalid_request)（未知のフィールド。Profile 単位の絞り込みは契約にない） |
 | G04 | FA1 を P1 の投稿が既に共有済み（`fixed`） | `[ShuttlePub 側]` P2 の別の投稿で FA1 を使う | `reserve` は 201・`already_fixed: true`。P2 の添付も同じ file のメタデータを参照し、以後の更新対象になる |
-| G05 | **暫定（R1）**: FA1 は Alice の file。Bob の投稿が FA1 を使おうとする | `[ShuttlePub 側]` Bob の投稿確定時に FA1 を `reserve` | Booskiff は 404（Z07）。**所有者限定は暫定の技術制限**で、他 Account 再利用の可否は未決（README §9。R2/R3 を採る場合はこの項目と Z07・Z08 を差し替える） |
+| G05 | **R1（ユーザー決定: 他 Account 再利用は当面禁止）**: FA1 は Alice の file。Bob の投稿が FA1 を使おうとする | `[ShuttlePub 側]` Bob の投稿確定時に FA1 を `reserve` | Booskiff は 404（Z07）。他 Account は他人の file を添付できない（所有者のみ予約・添付可）。共有（D9）の決定後に見直す（R2/R3 を採る場合はこの項目と Z07・Z08 を差し替える。README §9） |
 
 ## 12. 件数と網羅
 
@@ -221,11 +223,11 @@
 | C カタログ | 12 | 8 選択肢・管理者独自・版追加で固定済み不変・廃止・版省略 |
 | P 更新 | 20 | 版参照・no-op・正規化・固定後のタグ/分類・原子性 |
 | Z 認可 | 18 | 別 file・他人 file・他人の予約・存在秘匿・サービス/所有者/管理者の分離 |
-| S 予約 | 33 | 2 相・冪等・失効・削除・publish は固定しない |
+| S 予約 | 35 | 2 相・冪等・失効・削除・publish は固定しない |
 | X 同時変更 | 10 | 行ロック・楽観排他・デッドロック・初回行作成 |
 | F 失敗 | 10 | 応答喪失・投稿拒否・クラッシュ・連合配送失敗・フィード期限切れ |
 | B 一括・フィード | 13 | 共有済みのみ・通知のみ・取りこぼし防止・失敗分再試行 |
 | E 既存画像 | 11 | E1〜E6・backfill・冪等・dry-run |
 | N 非変更 | 4 | bytes/URL/キャッシュ・openapi・FileResponse |
-| G D11 | 5 | 案 B（全 Profile に反映）・Profile 非依存・他 Account 再利用は未決（暫定 R1） |
-| **合計** | **143** | |
+| G D11 | 5 | 案 B（全 Profile に反映）・Profile 非依存・他 Account 再利用は当面禁止（R1 採用） |
+| **合計** | **145** | |
